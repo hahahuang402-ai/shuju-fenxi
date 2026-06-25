@@ -1,0 +1,1756 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VAN类车上险销量 · 月度分析工作流</title>
+<!-- ===== embedded Python pipeline (verbatim from project, month-range made dynamic) ===== -->
+<script type="text/python" id="py_core">
+import pandas as pd, warnings
+warnings.filterwarnings('ignore')
+
+RAW='底表.xlsx'
+FULL = pd.read_excel(RAW, sheet_name=0)
+# 动态识别统计期间：最新年份为本期，其覆盖的连续月份为统计区间，上一年为同期
+MAXY = int(pd.to_numeric(FULL['年份'], errors='coerce').max())
+MINY = MAXY - 1
+_curmonths = pd.to_numeric(FULL.loc[pd.to_numeric(FULL['年份'],errors='coerce')==MAXY,'月份'], errors='coerce').dropna().astype(int)
+MAXM = int(_curmonths.max()) if len(_curmonths) else 12
+PERIOD = f'{MAXY}年1-{MAXM}月'
+PREV_FULL = f'{MINY}全年'
+
+DF14 = FULL[pd.to_numeric(FULL['月份'],errors='coerce').between(1,MAXM)]
+CUR  = DF14[pd.to_numeric(DF14['年份'],errors='coerce')==MAXY].copy()   # 本期
+PRE  = DF14[pd.to_numeric(DF14['年份'],errors='coerce')==MINY].copy()   # 去年同期
+Y25  = FULL[pd.to_numeric(FULL['年份'],errors='coerce')==MINY].copy()   # 去年全年
+
+MSEG = '米段（轴距划分）'
+VOL  = '容积段（新）'
+
+# ---- 地理维度：省份/城市均从底表动态识别（不再写死西北五省），按本期销量降序 ----
+def _rank_by_sales(frame, col, within=None):
+    fr = frame
+    if within:
+        for k,v in within.items():
+            if k in fr.columns: fr = fr[fr[k]==v]
+    if col not in fr.columns: return []
+    g = fr.groupby(col)['数量'].sum().sort_values(ascending=False)
+    out=[]
+    for x,v in g.items():
+        if v>0 and pd.notna(x) and str(x).strip()!='': out.append(x)
+    return out
+
+PROVINCES = _rank_by_sales(CUR,'省份') or _rank_by_sales(FULL,'省份')
+def cities_of(prov):
+    return _rank_by_sales(CUR,'城市',{'省份':prov}) or _rank_by_sales(FULL,'城市',{'省份':prov})
+
+_SSUM_CACHE={}
+def _clear_ssum_cache(): _SSUM_CACHE.clear()
+def ssum(frame, f):
+    if not f: return float(frame['数量'].sum())
+    items=tuple(sorted((k,(tuple(v) if isinstance(v,(list,tuple,set)) else v)) for k,v in f.items()))
+    key=(id(frame), items)
+    hit=_SSUM_CACHE.get(key)
+    if hit is not None: return hit
+    m = pd.Series(True, index=frame.index)
+    for k,v in f.items():
+        if isinstance(v,(list,tuple,set)): m &= frame[k].isin(v)
+        else: m &= (frame[k]==v)
+    res = float(frame.loc[m,'数量'].sum())
+    _SSUM_CACHE[key]=res
+    return res
+
+def sub(frame, f):
+    if not f: return frame
+    m = pd.Series(True, index=frame.index)
+    for k,v in f.items():
+        if isinstance(v,(list,tuple,set)): m &= frame[k].isin(v)
+        else: m &= (frame[k]==v)
+    return frame.loc[m]
+
+def fmt_pct(x):
+    if x is None: return None
+    if x=='净增长': return '净增长'
+    return round(x*100,1)
+
+def yoy(c,p):
+    if p==0: return '净增长' if c>0 else None
+    return c/p-1
+
+def share(v,tot):
+    return (v/tot) if (tot and tot>0) else None
+
+def brands_by_sales(frame, f=None, base=None):
+    fr = frame
+    if base: fr = sub(fr, base)
+    if f: fr = sub(fr, f)
+    g = fr.groupby('企业品牌')['数量'].sum().sort_values(ascending=False)
+    return [b for b,v in g.items() if v>0]
+</script>
+<script type="text/python" id="py_engine">
+import sys, warnings
+warnings.filterwarnings('ignore')
+sys.path.insert(0,'/work')
+from core import *
+from wr import *
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter, column_index_from_string as ci
+
+def C(s): return ci(s)
+
+def merged(*dicts):
+    out={}
+    for d in dicts:
+        if d: out.update(d)
+    return out
+
+BASE = {}
+
+def cell(rgf, brand, cf, want, denom_rgf=None, curF=None, preF=None):
+    if denom_rgf is None: denom_rgf = rgf
+    if curF is None: curF = CUR
+    if preF is None: preF = PRE
+    bf = {'企业品牌':brand} if brand is not None else {}
+    cur_v = ssum(curF, merged(BASE,rgf,cf,bf))
+    pre_v = ssum(preF, merged(BASE,rgf,cf,bf))
+    if want=='销量':
+        return cur_v if cur_v>0 else None
+    if want=='同比':
+        return fmt_pct(yoy(cur_v,pre_v))
+    if want=='占有率':
+        tot=ssum(curF, merged(BASE,denom_rgf,cf)); s=share(cur_v,tot)
+        return fmt_pct(s) if (s is not None and cur_v>0) else None
+    if want=='占同比':
+        sc=share(cur_v, ssum(curF, merged(BASE,denom_rgf,cf)))
+        sp=share(pre_v, ssum(preF, merged(BASE,denom_rgf,cf)))
+        if cur_v==0 and pre_v==0: return None
+        return round(((sc or 0)-(sp or 0))*100,1)
+    if want=='比重':
+        den=ssum(curF, merged(BASE,denom_rgf,cf,bf)); s=share(cur_v,den)
+        return fmt_pct(s) if (s is not None and cur_v>0) else None
+    raise ValueError(want)
+
+def build_values(colspec, rgf, brand, denom_rgf=None):
+    vals={}
+    for spec in colspec:
+        if len(spec)==4:
+            col, want, cf, opt = spec
+        else:
+            col, want, cf = spec; opt={}
+        dr = opt.get('denom', denom_rgf)
+        b  = opt.get('brand', brand)
+        vals[col]=cell(rgf, b, cf, want, dr,
+                       curF=opt.get('curF'), preF=opt.get('preF'))
+    return vals
+
+def pct_set(colspec):
+    return {spec[0] for spec in colspec if spec[1] in ('同比','占有率','占同比','比重')}
+
+def bizhong(rgf, cf, parent_rgf, brand=None):
+    bf = {'企业品牌':brand} if brand is not None else {}
+    num = ssum(CUR, merged(BASE, rgf, cf, bf))
+    den = ssum(CUR, merged(BASE, parent_rgf, cf))
+    s = share(num, den)
+    return fmt_pct(s) if (s is not None and num>0) else None
+
+def ztb_set(colspec):
+    return {spec[0] for spec in colspec if spec[1]=='占同比'}
+</script>
+<script type="text/python" id="py_wr">
+import warnings
+warnings.filterwarnings('ignore')
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+THIN = Side(style='thin', color='BFBFBF')
+BORDER = Border(left=THIN,right=THIN,top=THIN,bottom=THIN)
+HDR  = PatternFill('solid', fgColor='D9E1F2')
+HDR2 = PatternFill('solid', fgColor='E2EFDA')
+TOT  = PatternFill('solid', fgColor='FFF2CC')
+SUBT = PatternFill('solid', fgColor='FCE4D6')
+GREEN = PatternFill('solid', fgColor='C6EFCE')
+RED   = PatternFill('solid', fgColor='FFC7CE')
+GREEN_FONT = Font(color='006100')
+RED_FONT   = Font(color='9C0006')
+ZTB_THRESH = float('inf')
+CUR_ZTB = set()
+def set_ztb(cols):
+    global CUR_ZTB; CUR_ZTB = cols
+CENTER = Alignment(horizontal='center', vertical='center', wrap_text=True)
+CEN = Alignment(horizontal='center', vertical='center')
+BOLD = Font(bold=True)
+
+def setcell(ws, coord, val, merge=None, fill=HDR, bold=True):
+    c = ws[coord]; c.value = val
+    if merge: ws.merge_cells(merge)
+    c.alignment = CENTER; c.border = BORDER; c.font = Font(bold=bold)
+    if fill: c.fill = fill
+    return c
+
+def style_header_block(ws, r1, r2, c1, c2, fill=HDR):
+    for r in range(r1, r2+1):
+        for c in range(c1, c2+1):
+            cell = ws.cell(row=r, column=c)
+            cell.alignment = CENTER; cell.border = BORDER; cell.font = BOLD
+            if fill: cell.fill = fill
+
+def write_row(ws, r, label_cells, values, pct_idx, ncol, fill=None, bold=False, ztb_idx=None):
+    ztb_idx = ztb_idx if ztb_idx is not None else CUR_ZTB
+    for col, txt in label_cells:
+        cell = ws.cell(row=r, column=col, value=txt)
+        cell.alignment = CEN; cell.border = BORDER
+        if bold: cell.font = BOLD
+        if fill: cell.fill = fill
+    for col in range(1, ncol+1):
+        if any(col==lc[0] for lc in label_cells): continue
+        cell = ws.cell(row=r, column=col)
+        val = values.get(col)
+        if val is None:
+            cell.value = None
+        elif val == '净增长':
+            cell.value = '净增长'
+        elif col in pct_idx:
+            cell.value = val/100.0
+            cell.number_format = '0.0%'
+        else:
+            cell.value = val
+        cell.alignment = CEN; cell.border = BORDER
+        if bold: cell.font = BOLD
+        if fill: cell.fill = fill
+        if col in ztb_idx and isinstance(val,(int,float)):
+            if val >= ZTB_THRESH:
+                cell.fill = GREEN; cell.font = GREEN_FONT if not bold else Font(bold=True,color='006100')
+            elif val <= -ZTB_THRESH:
+                cell.fill = RED; cell.font = RED_FONT if not bold else Font(bold=True,color='9C0006')
+
+def set_widths(ws, first_w, rest_w, ncol, first_cols=1):
+    for i in range(1, first_cols+1):
+        ws.column_dimensions[get_column_letter(i)].width = first_w
+    for c in range(first_cols+1, ncol+1):
+        ws.column_dimensions[get_column_letter(c)].width = rest_w
+</script>
+<script type="text/python" id="py_build">
+import warnings
+warnings.filterwarnings('ignore')
+import sys; sys.path.insert(0,'/work')
+import engine, core
+from core import *
+from wr import *
+from engine import *
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string as C
+
+P = PERIOD          # 例如 '2026年1-5月'
+PY = PREV_FULL      # 例如 '2025全年'
+
+wb = Workbook()
+DV={'大中VAN':'大VAN'}; ZV={'大中VAN':'中VAN'}
+TR={'燃料种类2':'传统燃料'}; NE={'燃料种类2':'新能源'}
+
+# ===== 区域范围（sheet5-9 最左新增列）支持 =====
+# 每张表先输出「整体」（全部省份合计，等同旧版口径），再按本期销量降序逐省输出；
+# 省份为底表动态识别（与 PROVINCES 一致），不写死西北五省。
+import re as _re
+def _shift(coord, off):
+    # 将坐标/区间字符串里的列字母整体右移 off 列，如 _shift('A2:E3',1)=='B2:F3'
+    if not off: return coord
+    return _re.sub(r'([A-Z]+)(\d+)',
+                   lambda m: get_column_letter(C(m.group(1))+off)+m.group(2), coord)
+def setc(ws, coord, val, off, merge=None, **kw):
+    # 带列偏移的 setcell（区域范围列固定占 A 列，其余表头整体右移 off）
+    return setcell(ws, _shift(coord,off), val,
+                   merge=(_shift(merge,off) if merge else None), **kw)
+def shift_spec(cs, off):
+    # 将 colspec 里的目标列索引整体右移 off 列
+    if not off: return cs
+    return [tuple([s[0]+off])+tuple(s[1:]) for s in cs]
+# 区域列表：('标签','汇总行标签', 区域筛选)
+# 灵活识别：底表多省 -> 整体=所有省，细分逐省；底表单省 -> 整体=该省全省，细分逐地级市。
+if len(PROVINCES) <= 1:
+    _bp = PROVINCES[0] if PROVINCES else None
+    _subs = cities_of(_bp) if _bp else _rank_by_sales(CUR,'城市')
+    REGIONS = [('整体','总计',{})] + [(c, f'{c} 汇总', {'城市':c}) for c in _subs]
+else:
+    REGIONS = [('整体','总计',{})] + [(p, f'{p} 汇总', {'省份':p}) for p in PROVINCES]
+
+# 性能关键：按区域「整段切片」底表，而不是在每个单元格计算时对全表反复做布尔筛选。
+# 整体用全量帧；分省时把 CUR/PRE/Y25 一次性切到该省的行，后续所有 ssum/cell 仅在小帧上运算。
+CUR0, PRE0, Y250 = CUR, PRE, Y25
+CUR_VAN, PRE_VAN, Y25_VAN = CUR, PRE, Y25   # VAN 原始帧，供 sheet10 用完还原
+def use_dataset(c0, p0, y0):
+    # 切换「当前数据集」（sheet1-9 用 VAN 底表；sheet10 用微卡底表），并复位为全量帧
+    global CUR0, PRE0, Y250
+    CUR0, PRE0, Y250 = c0, p0, y0
+    set_region({})
+def set_region(rgf0):
+    global CUR, PRE, Y25
+    if not rgf0:
+        cur, pre, y = CUR0, PRE0, Y250
+    else:
+        cur, pre, y = sub(CUR0,rgf0), sub(PRE0,rgf0), sub(Y250,rgf0)
+    CUR, PRE, Y25 = cur, pre, y      # build 模块内的引用
+    engine.CUR, engine.PRE = cur, pre  # engine.cell() 默认读取的帧
+    core._clear_ssum_cache()           # 切换区域后清空 ssum 记忆缓存（帧已变）
+
+def sheet1(ws):
+    cs = [
+        (C('B'),'销量',{}),(C('C'),'同比',{}),(C('D'),'占有率',{}),(C('E'),'占同比',{}),
+        (C('F'),'销量',DV),(C('G'),'同比',DV),(C('H'),'占有率',DV),(C('I'),'占同比',DV),
+        (C('J'),'销量',{**DV,**TR}),(C('K'),'占有率',{**DV,**TR}),(C('L'),'占同比',{**DV,**TR}),
+        (C('M'),'销量',{**DV,**NE}),(C('N'),'占有率',{**DV,**NE}),(C('O'),'占同比',{**DV,**NE}),
+        (C('P'),'销量',ZV),(C('Q'),'同比',ZV),(C('R'),'占有率',ZV),(C('S'),'占同比',ZV),
+        (C('T'),'销量',{**ZV,**TR}),(C('U'),'占有率',{**ZV,**TR}),(C('V'),'占同比',{**ZV,**TR}),
+        (C('W'),'销量',{**ZV,**NE}),(C('X'),'占有率',{**ZV,**NE}),(C('Y'),'占同比',{**ZV,**NE}),
+        (C('Z'),'销量',TR),(C('AA'),'同比',TR),(C('AB'),'占有率',TR),
+        (C('AC'),'销量',NE),(C('AD'),'同比',NE),(C('AE'),'占有率',NE),
+    ]
+    ncol=C('AE'); ps=pct_set(cs); set_ztb(ztb_set(cs))
+    setcell(ws,'A1',f'{P}销量',merge='A1:AE1')
+    setcell(ws,'A2','企业品牌',merge='A2:A4'); setcell(ws,'B2','汇总',merge='B2:E3')
+    setcell(ws,'F2','大VAN',merge='F2:O2'); setcell(ws,'P2','中VAN',merge='P2:Y2')
+    setcell(ws,'Z2','传统燃料',merge='Z2:AB3'); setcell(ws,'AC2','新能源',merge='AC2:AE3')
+    setcell(ws,'F3','大VAN汇总',merge='F3:I3'); setcell(ws,'J3','传统燃料',merge='J3:L3'); setcell(ws,'M3','新能源',merge='M3:O3')
+    setcell(ws,'P3','中VAN汇总',merge='P3:S3'); setcell(ws,'T3','传统燃料',merge='T3:V3'); setcell(ws,'W3','新能源',merge='W3:Y3')
+    h4=['销量','同比','占有率','占同比','销量','同比','占有率','占同比','销量','占有率','占同比','销量','占有率','占同比','销量','同比','占有率','占同比','销量','占有率','占同比','销量','占有率','占同比','销量','同比','占有率','销量','同比','占有率']
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(2+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+    r=5
+    for b in brands_by_sales(CUR):
+        write_row(ws,r,[(1,b)],build_values(cs,{},b),ps,ncol); r+=1
+    write_row(ws,r,[(1,'总计')],build_values(cs,{},None),ps,ncol,fill=TOT,bold=True)
+    set_widths(ws,11,8.5,ncol); ws.freeze_panes='B5'
+
+def sheet2(ws):
+    cs = [
+        (C('C'),'销量',{}),(C('D'),'同比',{}),(C('E'),'占有率',{}),(C('F'),'占同比',{}),
+        (C('G'),'销量',DV),(C('H'),'同比',DV),(C('I'),'占有率',DV),(C('J'),'占同比',DV),
+        (C('K'),'销量',{**DV,**TR}),(C('L'),'同比',{**DV,**TR}),(C('M'),'占有率',{**DV,**TR}),(C('N'),'占同比',{**DV,**TR}),
+        (C('O'),'销量',{**DV,**NE}),(C('P'),'同比',{**DV,**NE}),(C('Q'),'占有率',{**DV,**NE}),(C('R'),'占同比',{**DV,**NE}),
+        (C('S'),'销量',ZV),(C('T'),'同比',ZV),(C('U'),'占有率',ZV),(C('V'),'占同比',ZV),
+        (C('W'),'销量',{**ZV,**TR}),(C('X'),'同比',{**ZV,**TR}),(C('Y'),'占有率',{**ZV,**TR}),(C('Z'),'占同比',{**ZV,**TR}),
+        (C('AA'),'销量',{**ZV,**NE}),(C('AB'),'同比',{**ZV,**NE}),(C('AC'),'占有率',{**ZV,**NE}),(C('AD'),'占同比',{**ZV,**NE}),
+    ]
+    ncol=C('AD'); ps=pct_set(cs); set_ztb(ztb_set(cs))
+    setcell(ws,'A1',f'{P}销量',merge='A1:AD1')
+    setcell(ws,'A2','省份',merge='A2:A4'); setcell(ws,'B2','企业品牌',merge='B2:B4'); setcell(ws,'C2','汇总',merge='C2:F3')
+    setcell(ws,'G2','大VAN',merge='G2:R2'); setcell(ws,'S2','中VAN',merge='S2:AD2')
+    setcell(ws,'G3','大VAN汇总',merge='G3:J3'); setcell(ws,'K3','传统燃料',merge='K3:N3'); setcell(ws,'O3','新能源',merge='O3:R3')
+    setcell(ws,'S3','中VAN汇总',merge='S3:V3'); setcell(ws,'W3','传统燃料',merge='W3:Z3'); setcell(ws,'AA3','新能源',merge='AA3:AD3')
+    h4=['销量','同比','占有率','占同比']*7
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(3+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+    r=5
+    for prov in PROVINCES:
+        pf={'省份':prov}; bs=brands_by_sales(CUR,pf); rstart=r
+        for b in bs:
+            write_row(ws,r,[(2,b)],build_values(cs,pf,b,denom_rgf=pf),ps,ncol); r+=1
+        write_row(ws,r,[(1,f'{prov} 汇总')],build_values(cs,pf,None,denom_rgf=pf),ps,ncol,fill=SUBT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=2)
+        if bs:
+            ws.merge_cells(start_row=rstart,start_column=1,end_row=rstart+len(bs)-1,end_column=1)
+            ws.cell(row=rstart,column=1,value=prov).alignment=CEN
+        r+=1
+    write_row(ws,r,[(1,'总计')],build_values(cs,{},None),ps,ncol,fill=TOT,bold=True)
+    ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=2)
+    set_widths(ws,10,8.2,ncol,first_cols=2); ws.freeze_panes='C5'
+
+def sheet3(ws):
+    # 模式：province=分省（行=各省，原版）；city=分城市（行=某省各城市，如江苏模板）
+    # auto：底表仅含 1 个省份时自动切到 city 模式
+    mode = globals().get('SHEET3_MODE','auto')
+    target = globals().get('SHEET3_PROV',None)
+    if mode=='auto':
+        mode = 'city' if len(PROVINCES)==1 else 'province'
+    if mode=='city' and not target:
+        target = PROVINCES[0] if PROVINCES else None
+    off = 1 if mode=='city' else 0   # city 模式在“省份”后插入“城市”列，数据整体右移 1 列
+    def sc(letter, d=0):              # 列字母按 off 平移
+        return get_column_letter(C(letter)+off+d)
+    FT={'brand':'福田'}
+    cs=[
+        (C(sc('B')),'销量',{}),(C(sc('C')),'同比',{}),
+        (C(sc('D')),'销量',{},FT),(C(sc('E')),'占有率',{},FT),(C(sc('F')),'占同比',{},FT),
+        (C(sc('G')),'销量',DV),(C(sc('H')),'同比',DV),
+        (C(sc('I')),'销量',DV,FT),(C(sc('J')),'占有率',DV,FT),(C(sc('K')),'占同比',DV,FT),
+        (C(sc('L')),'销量',{**DV,**TR}),(C(sc('M')),'销量',{**DV,**TR},FT),(C(sc('N')),'占有率',{**DV,**TR},FT),(C(sc('O')),'占同比',{**DV,**TR},FT),
+        (C(sc('P')),'销量',{**DV,**NE}),(C(sc('Q')),'销量',{**DV,**NE},FT),(C(sc('R')),'占有率',{**DV,**NE},FT),(C(sc('S')),'占同比',{**DV,**NE},FT),
+        (C(sc('T')),'销量',ZV),(C(sc('U')),'同比',ZV),
+        (C(sc('V')),'销量',ZV,FT),(C(sc('W')),'占有率',ZV,FT),(C(sc('X')),'占同比',ZV,FT),
+        (C(sc('Y')),'销量',{**ZV,**TR}),(C(sc('Z')),'销量',{**ZV,**TR},FT),(C(sc('AA')),'占有率',{**ZV,**TR},FT),(C(sc('AB')),'占同比',{**ZV,**TR},FT),
+        (C(sc('AC')),'销量',{**ZV,**NE}),(C(sc('AD')),'销量',{**ZV,**NE},FT),(C(sc('AE')),'占有率',{**ZV,**NE},FT),(C(sc('AF')),'占同比',{**ZV,**NE},FT),
+    ]
+    ncol=C(sc('AF')); ps=pct_set(cs); set_ztb(ztb_set(cs))
+    setcell(ws,'A1',f'{P}销量',merge=f'A1:{sc("AF")}1')
+    if off:  # city 模式：省份 + 城市 两个标签列
+        setcell(ws,'A2','省份',merge='A2:A5'); setcell(ws,'B2','城市',merge='B2:B5')
+    else:
+        setcell(ws,'A2','省份',merge='A2:A5')
+    setcell(ws,f'{sc("B")}2','汇总',merge=f'{sc("B")}2:{sc("C")}4'); setcell(ws,f'{sc("D")}2','福田',merge=f'{sc("D")}2:{sc("F")}4')
+    setcell(ws,f'{sc("G")}2','大VAN',merge=f'{sc("G")}2:{sc("S")}2'); setcell(ws,f'{sc("T")}2','中VAN',merge=f'{sc("T")}2:{sc("AF")}2')
+    setcell(ws,f'{sc("G")}3','大VAN汇总',merge=f'{sc("G")}3:{sc("H")}4'); setcell(ws,f'{sc("I")}3','福田大VAN',merge=f'{sc("I")}3:{sc("K")}4')
+    setcell(ws,f'{sc("L")}3','传统燃料',merge=f'{sc("L")}3:{sc("O")}3'); setcell(ws,f'{sc("P")}3','新能源',merge=f'{sc("P")}3:{sc("S")}3')
+    setcell(ws,f'{sc("T")}3','中VAN汇总',merge=f'{sc("T")}3:{sc("U")}4'); setcell(ws,f'{sc("V")}3','福田中VAN',merge=f'{sc("V")}3:{sc("X")}4')
+    setcell(ws,f'{sc("Y")}3','传统燃料',merge=f'{sc("Y")}3:{sc("AB")}3'); setcell(ws,f'{sc("AC")}3','新能源',merge=f'{sc("AC")}3:{sc("AF")}3')
+    for col,txt in [('L4','汇总'),('M4','福田'),('P4','汇总'),('Q4','福田'),('Y4','汇总'),('Z4','福田'),('AC4','汇总'),('AD4','福田')]:
+        setcell(ws,f'{sc(col[:-1])}4',txt)
+    h5=['销量','同比','销量','占有率','占同比','销量','同比','销量','占有率','占同比','销量','销量','占有率','占同比','销量','销量','占有率','占同比','销量','同比','销量','占有率','占同比','销量','销量','占有率','占同比','销量','销量','占有率','占同比']
+    for i,v in enumerate(h5): setcell(ws,f'{get_column_letter(2+off+i)}5',v,fill=HDR2)
+    style_header_block(ws,1,5,1,ncol)
+    r=6
+    if off:  # 分城市：行=目标省份的各城市
+        cities=cities_of(target) if target else []
+        for city in cities:
+            cf={'省份':target,'城市':city}
+            write_row(ws,r,[(2,city)],build_values(cs,cf,None,denom_rgf=cf),ps,ncol); r+=1
+        write_row(ws,r,[(2,f'{target} 汇总')],build_values(cs,{'省份':target},None,denom_rgf={'省份':target}),ps,ncol,fill=TOT,bold=True)
+        if r>6:  # 省份名纵向合并覆盖所有城市行+汇总行
+            ws.merge_cells(start_row=6,start_column=1,end_row=r,end_column=1)
+            ws.cell(row=6,column=1,value=target).alignment=CEN
+    else:    # 分省：行=各省（动态）
+        for prov in PROVINCES:
+            pf={'省份':prov}
+            write_row(ws,r,[(1,prov)],build_values(cs,pf,None,denom_rgf=pf),ps,ncol); r+=1
+        write_row(ws,r,[(1,'总计')],build_values(cs,{},None),ps,ncol,fill=TOT,bold=True)
+    set_widths(ws,10,8.2,ncol,first_cols=1+off); ws.freeze_panes=f'{sc("B")}6'
+
+def sheet4(ws):
+    setcell(ws,'A1',f'{P}销量',merge='A1:AA1')
+    setcell(ws,'A2','省份',merge='A2:A4'); setcell(ws,'B2','城市',merge='B2:B4'); setcell(ws,'C2','燃料种类',merge='C2:C4')
+    setcell(ws,'D2','整体市场情况',merge='D2:K2'); setcell(ws,'L2','大VAN',merge='L2:S2'); setcell(ws,'T2','中VAN',merge='T2:AA2')
+    setcell(ws,'D3','汇总',merge='D3:F3'); setcell(ws,'G3','福田',merge='G3:K3')
+    setcell(ws,'L3','大VAN汇总',merge='L3:N3'); setcell(ws,'O3','福田',merge='O3:S3')
+    setcell(ws,'T3','中VAN汇总',merge='T3:V3'); setcell(ws,'W3','福田',merge='W3:AA3')
+    h4=['销量','同比','比重','销量','同比','比重','占有率','占同比']*3
+    ncol=C('AA')
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(4+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+    def specfor(parent_rgf):
+        FT={'brand':'福田'}
+        spec=[]
+        for cbase,scope in [(C('D'),{}),(C('L'),DV),(C('T'),ZV)]:
+            layout=[(0,'销量',{}),(1,'同比',{}),(2,'比重',{'denom':parent_rgf}),
+                    (3,'销量',FT),(4,'同比',FT),(5,'比重',{**FT,'denom':parent_rgf}),
+                    (6,'占有率',FT),(7,'占同比',FT)]
+            for off,want,opt in layout:
+                spec.append((cbase+off,want,scope,opt))
+        return spec
+    ps=pct_set(specfor({})); set_ztb(ztb_set(specfor({})))
+    prov_cities={prov:cities_of(prov) for prov in PROVINCES}
+    r=5
+    for prov,cities in prov_cities.items():
+        provf={'省份':prov}; prov_rs=r
+        for city in cities:
+            cityf={'省份':prov,'城市':city}; city_rs=r
+            for fname,ff in [('传统燃料',TR),('新能源',NE)]:
+                rgf={**cityf,**ff}
+                if ssum(CUR,rgf)<=0 and ssum(PRE,rgf)<=0: continue
+                write_row(ws,r,[(3,fname)],build_values(specfor(cityf),rgf,None),ps,ncol); r+=1
+            write_row(ws,r,[(2,f'{city} 汇总')],build_values(specfor(provf),cityf,None),ps,ncol,fill=SUBT,bold=True)
+            ws.merge_cells(start_row=r,start_column=2,end_row=r,end_column=3)
+            if r>city_rs:
+                ws.merge_cells(start_row=city_rs,start_column=2,end_row=r-1,end_column=2)
+                ws.cell(row=city_rs,column=2,value=city).alignment=CEN
+            r+=1
+        write_row(ws,r,[(1,f'{prov} 汇总')],build_values(specfor({}),provf,None),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=3)
+        ws.merge_cells(start_row=prov_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=prov_rs,column=1,value=prov).alignment=CEN
+        r+=1
+    write_row(ws,r,[(1,'总计')],build_values(specfor({}),{},None),ps,ncol,fill=TOT,bold=True)
+    ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=3)
+    set_widths(ws,9,8.0,ncol,first_cols=3); ws.freeze_panes='D5'
+
+def sheet5(ws):
+    off=1
+    scenes=[('改装定制',C('J')),('客货两用',C('N')),('商旅客运',C('R')),('专业物流',C('V'))]
+    def specfor(denom_rgf):
+        cs=[
+            (C('D'),'销量',{},{'curF':Y25}),(C('E'),'占有率',{},{'curF':Y25,'denom':denom_rgf}),
+            (C('F'),'销量',{}),(C('G'),'同比',{}),(C('H'),'占有率',{},{'denom':denom_rgf}),(C('I'),'占同比',{},{'denom':denom_rgf}),
+        ]
+        for scn,cb in scenes:
+            ff={'功能分类2':scn}
+            cs += [(cb,'销量',ff),(cb+1,'同比',ff),(cb+2,'占有率',ff,{'denom':denom_rgf}),(cb+3,'占同比',ff,{'denom':denom_rgf})]
+        return shift_spec(cs, off)
+    ncol=C('Y')+off; ps=pct_set(specfor({})); set_ztb(ztb_set(specfor({})))
+    setcell(ws,'A1','区域范围',merge='A1:A4')
+    setc(ws,'A1',f'{P}大VAN销量',off,merge='A1:Y1')
+    setc(ws,'A2','分燃料',off,merge='A2:A4'); setc(ws,'B2','米段',off,merge='B2:B4'); setc(ws,'C2','企业品牌',off,merge='C2:C4')
+    setc(ws,'D2',PY,off,merge='D2:E3'); setc(ws,'F2',f'{P}汇总',off,merge='F2:I3'); setc(ws,'J2','分场景',off,merge='J2:Y2')
+    setc(ws,'J3','改装定制',off,merge='J3:M3'); setc(ws,'N3','客货两用',off,merge='N3:Q3'); setc(ws,'R3','商旅客运',off,merge='R3:U3'); setc(ws,'V3','专业物流',off,merge='V3:Y3')
+    h4=['销量','占有率','销量','同比','占有率','占同比']+['销量','同比','占有率','占同比']*4
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(4+off+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+    def block(rgf0,label,total_label,r):
+        set_region(rgf0); engine.BASE=DV; data_rs=r
+        for fuel,ff in [('传统燃料',TR),('新能源',NE)]:
+            fuel_rs=r
+            msegs=[m for m in ['5.0米','5.5米','6.0米'] if ssum(CUR,{**ff,MSEG:m})>0]
+            for mseg in msegs:
+                grp={**ff,MSEG:mseg}; m_rs=r
+                bs=brands_by_sales(CUR,grp,base=DV)
+                for b in bs:
+                    write_row(ws,r,[(3+off,b)],build_values(specfor(grp),grp,b),ps,ncol); r+=1
+                write_row(ws,r,[(2+off,f'{mseg} 汇总')],build_values(specfor(grp),grp,None),ps,ncol,fill=SUBT,bold=True)
+                ws.merge_cells(start_row=r,start_column=2+off,end_row=r,end_column=3+off)
+                if bs:
+                    ws.merge_cells(start_row=m_rs,start_column=2+off,end_row=m_rs+len(bs)-1,end_column=2+off)
+                    ws.cell(row=m_rs,column=2+off,value=mseg).alignment=CEN
+                r+=1
+            write_row(ws,r,[(1+off,f'{fuel} 汇总')],build_values(specfor(ff),ff,None),ps,ncol,fill=TOT,bold=True)
+            ws.merge_cells(start_row=r,start_column=1+off,end_row=r,end_column=3+off)
+            ws.merge_cells(start_row=fuel_rs,start_column=1+off,end_row=r-1,end_column=1+off)
+            ws.cell(row=fuel_rs,column=1+off,value=fuel).alignment=CEN
+            r+=1
+        if r>data_rs:
+            ws.merge_cells(start_row=data_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=data_rs,column=1,value=label).alignment=CEN
+        write_row(ws,r,[(1,total_label)],build_values(specfor({}),{},None),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=3+off)
+        return r+1
+    r=5
+    for label,total_label,rgf0 in REGIONS:
+        r=block(rgf0,label,total_label,r)
+    set_widths(ws,9,8.0,ncol,first_cols=3+off); ws.freeze_panes=_shift('D5',off)
+    set_region({}); engine.BASE={}
+
+def sheet6(ws):
+    off=1
+
+    # 动态品牌列表：大VAN+燃料筛选下，按本期总销量降序，保留覆盖累计90%所需品牌；福田不在其中则补至末尾
+    def top90_van(fuel_f):
+        all_brands = brands_by_sales(CUR, fuel_f, base=DV)
+        if not all_brands: return []
+        tot = ssum(CUR, merged(DV, fuel_f))
+        if not tot: return []
+        cum = 0.0; out = []
+        for b in all_brands:
+            v = ssum(CUR, merged(DV, fuel_f, {'企业品牌': b}))
+            out.append(b); cum += v
+            if cum / tot >= 0.9: break
+        if '福田' not in out and '福田' in all_brands:
+            out.append('福田')
+        return out
+
+    tr_brands = top90_van(TR)
+    ne_brands = top90_van(NE)
+
+    # 列索引（不含 off）
+    TR_ST  = C('G')                          # 传统燃料品牌起始列
+    NE_SUM = TR_ST + len(tr_brands)*3        # 新能源汇总起始列
+    NE_ST  = NE_SUM + 2                      # 新能源品牌起始列
+    LAST   = (NE_ST + len(ne_brands)*3 - 1) if ne_brands else (NE_SUM + 1)
+    ncol   = LAST + off
+
+    def specfor(parent_rgf):
+        s = [
+            (C('C'),'销量',{}),(C('D'),'比重',{},{'denom':parent_rgf}),
+            (C('E'),'销量',TR),(C('F'),'比重',TR,{'denom':parent_rgf}),
+        ]
+        for i,b in enumerate(tr_brands):
+            cb = TR_ST + i*3
+            s += [(cb,'销量',TR,{'brand':b}),(cb+1,'比重',TR,{'brand':b,'denom':parent_rgf}),(cb+2,'占有率',TR,{'brand':b})]
+        s += [(NE_SUM,'销量',NE),(NE_SUM+1,'比重',NE,{'denom':parent_rgf})]
+        for i,b in enumerate(ne_brands):
+            cb = NE_ST + i*3
+            s += [(cb,'销量',NE,{'brand':b}),(cb+1,'比重',NE,{'brand':b,'denom':parent_rgf}),(cb+2,'占有率',NE,{'brand':b})]
+        return s
+    def spec(parent_rgf): return shift_spec(specfor(parent_rgf), off)
+    ps=pct_set(spec({})); set_ztb(ztb_set(spec({})))
+
+    def GL(c): return get_column_letter(c)   # 无 off 列字母（供 setc 使用）
+
+    setcell(ws,'A1','区域范围',merge='A1:A4')
+    setc(ws,'A1',f'{P}大VAN市场销量',off,merge=f'A1:{GL(LAST)}1')
+    setc(ws,'A2','米段',off,merge='A2:A4'); setc(ws,'B2','功能分类',off,merge='B2:B4'); setc(ws,'C2','汇总',off,merge='C2:D3')
+    # 传统燃料大区（E 到 NE_SUM-1）
+    setc(ws,'E2','传统燃料',off,merge=f'E2:{GL(NE_SUM-1)}2')
+    setc(ws,'E3','传统燃料汇总',off,merge='E3:F3')
+    for i,b in enumerate(tr_brands):
+        cb = TR_ST + i*3
+        setc(ws,f'{GL(cb)}3',b,off,merge=f'{GL(cb)}3:{GL(cb+2)}3')
+    # 新能源大区（NE_SUM 到 LAST）
+    setc(ws,f'{GL(NE_SUM)}2','新能源',off,merge=f'{GL(NE_SUM)}2:{GL(LAST)}2')
+    setc(ws,f'{GL(NE_SUM)}3','新能源汇总',off,merge=f'{GL(NE_SUM)}3:{GL(NE_SUM+1)}3')
+    for i,b in enumerate(ne_brands):
+        cb = NE_ST + i*3
+        setc(ws,f'{GL(cb)}3',b,off,merge=f'{GL(cb)}3:{GL(cb+2)}3')
+    # 第4行指标标签
+    h4 = ['销量','比重','销量','比重']+['销量','比重','占有率']*len(tr_brands)+['销量','比重']+['销量','比重','占有率']*len(ne_brands)
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(3+off+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+
+    funcs=['改装定制','客货两用','商旅客运','专业物流']
+    def block(rgf0,label,total_label,r):
+        set_region(rgf0); engine.BASE=DV; data_rs=r
+        for mseg in ['5.0米','5.5米','6.0米']:
+            mf={MSEG:mseg}; m_rs=r
+            for fn in funcs:
+                grp={MSEG:mseg,'功能分类2':fn}
+                write_row(ws,r,[(2+off,fn)],build_values(spec(mf),grp,None),ps,ncol); r+=1
+            write_row(ws,r,[(1+off,f'{mseg} 汇总')],build_values(spec({}),mf,None),ps,ncol,fill=SUBT,bold=True)
+            ws.merge_cells(start_row=r,start_column=1+off,end_row=r,end_column=2+off)
+            ws.merge_cells(start_row=m_rs,start_column=1+off,end_row=m_rs+len(funcs)-1,end_column=1+off)
+            ws.cell(row=m_rs,column=1+off,value=mseg).alignment=CEN
+            r+=1
+        all_rs=r
+        for fn in funcs:
+            grp={'功能分类2':fn}
+            write_row(ws,r,[(2+off,fn)],build_values(spec({}),grp,None),ps,ncol); r+=1
+        ws.merge_cells(start_row=all_rs,start_column=1+off,end_row=r-1,end_column=1+off)
+        ws.cell(row=all_rs,column=1+off,value='所有米段汇总').alignment=CEN
+        if r>data_rs:
+            ws.merge_cells(start_row=data_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=data_rs,column=1,value=label).alignment=CEN
+        write_row(ws,r,[(1,total_label)],build_values(spec({}),{},None),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=2+off)
+        return r+1
+    r=5
+    for label,total_label,rgf0 in REGIONS:
+        r=block(rgf0,label,total_label,r)
+    set_widths(ws,9,7.5,ncol,first_cols=2+off); ws.freeze_panes=_shift('C5',off)
+    set_region({}); engine.BASE={}
+
+def sheet7(ws):
+    off=1
+    engine.BASE = ZV
+    V6={VOL:'6m³'}; V7={VOL:'7m³'}; V8={VOL:'8m³'}
+    def specfor(denom_rgf):
+        cs=[
+            (C('C'),'销量',{}),(C('D'),'同比',{}),(C('E'),'占有率',{},{'denom':denom_rgf}),(C('F'),'占同比',{},{'denom':denom_rgf}),
+            (C('G'),'销量',TR),(C('H'),'同比',TR),(C('I'),'占有率',TR,{'denom':denom_rgf}),(C('J'),'占同比',TR,{'denom':denom_rgf}),
+            (C('K'),'销量',NE),(C('L'),'同比',NE),(C('M'),'占有率',NE,{'denom':denom_rgf}),(C('N'),'占同比',NE,{'denom':denom_rgf}),
+            (C('O'),'销量',{**NE,**V6}),(C('P'),'同比',{**NE,**V6}),(C('Q'),'占有率',{**NE,**V6},{'denom':denom_rgf}),(C('R'),'占同比',{**NE,**V6},{'denom':denom_rgf}),
+            (C('S'),'销量',{**NE,**V7}),(C('T'),'同比',{**NE,**V7}),(C('U'),'占有率',{**NE,**V7},{'denom':denom_rgf}),(C('V'),'占同比',{**NE,**V7},{'denom':denom_rgf}),
+            (C('W'),'销量',{**NE,**V8}),(C('X'),'同比',{**NE,**V8}),(C('Y'),'占有率',{**NE,**V8},{'denom':denom_rgf}),(C('Z'),'占同比',{**NE,**V8},{'denom':denom_rgf}),
+        ]
+        return shift_spec(cs, off)
+    ncol=C('Z')+off; ps=pct_set(specfor({})); set_ztb(ztb_set(specfor({})))
+    setcell(ws,'A1','区域范围',merge='A1:A4')
+    setc(ws,'A1',f'{P}中VAN市场数据',off,merge='A1:Z1')
+    setc(ws,'A2','明盲窗',off,merge='A2:A4'); setc(ws,'B2','企业品牌',off,merge='B2:B4'); setc(ws,'C2','汇总',off,merge='C2:F3')
+    setc(ws,'G2','传统能源汇总',off,merge='G2:J3'); setc(ws,'K2','新能源汇总',off,merge='K2:N3'); setc(ws,'O2','新能源',off,merge='O2:Z2')
+    setc(ws,'O3','6m³',off,merge='O3:R3'); setc(ws,'S3','7m³',off,merge='S3:V3'); setc(ws,'W3','8m³',off,merge='W3:Z3')
+    h4=['销量','同比','占有率','占同比']*6
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(3+off+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+    def block(rgf0,reg_label,r):
+        set_region(rgf0); engine.BASE=ZV; data_rs=r
+        is_overall = not rgf0
+        win_all_label = reg_label if is_overall else f'{reg_label} 整体'
+        win_all_total = '总计' if is_overall else f'{reg_label} 汇总'
+        ov_rs=r; bs=brands_by_sales(CUR,base=ZV)
+        for b in bs:
+            write_row(ws,r,[(2+off,b)],build_values(specfor({}),{},b),ps,ncol); r+=1
+        write_row(ws,r,[(1+off,win_all_total)],build_values(specfor({}),{},None),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1+off,end_row=r,end_column=2+off)
+        if bs:
+            ws.merge_cells(start_row=ov_rs,start_column=1+off,end_row=ov_rs+len(bs)-1,end_column=1+off)
+            ws.cell(row=ov_rs,column=1+off,value=win_all_label).alignment=CEN
+        r+=1
+        for win in ['盲窗','明窗']:
+            wf={'窗':win}; w_rs=r; bs=brands_by_sales(CUR,wf,base=ZV)
+            for b in bs:
+                write_row(ws,r,[(2+off,b)],build_values(specfor(wf),wf,b),ps,ncol); r+=1
+            write_row(ws,r,[(1+off,f'{win} 汇总')],build_values(specfor(wf),wf,None),ps,ncol,fill=SUBT,bold=True)
+            ws.merge_cells(start_row=r,start_column=1+off,end_row=r,end_column=2+off)
+            if bs:
+                ws.merge_cells(start_row=w_rs,start_column=1+off,end_row=w_rs+len(bs)-1,end_column=1+off)
+                ws.cell(row=w_rs,column=1+off,value=win).alignment=CEN
+            r+=1
+        if r>data_rs:
+            ws.merge_cells(start_row=data_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=data_rs,column=1,value=reg_label).alignment=CEN
+        return r
+    r=5
+    for label,_total,rgf0 in REGIONS:
+        r=block(rgf0,label,r)
+    set_widths(ws,9,8.0,ncol,first_cols=2+off); ws.freeze_panes=_shift('C5',off)
+    set_region({}); engine.BASE={}
+
+def sheet8(ws):
+    off=1
+    FUEL='燃料种类'
+    VANS={'欧系中VAN':(C('C'),C('D')),'日系大VAN':(C('H'),C('I')),'日系中VAN':(C('M'),C('N'))}
+    fuel_map={'CNG':['CNG','天然气'],'柴油':['柴油'],'纯电动':['纯电动'],'汽油':['汽油']}
+    vanset=['欧系中VAN','日系大VAN','日系中VAN']
+    def specfor(van, denom_rgf, fuelvals):
+        c25, c26 = VANS[van]
+        vf={'VAN种类':van, FUEL:fuelvals}
+        return [
+            (c25,'销量',vf,{'curF':Y25}),
+            (c26,'销量',vf),(c26+1,'同比',vf),(c26+2,'占有率',vf,{'denom':denom_rgf}),(c26+3,'占同比',vf,{'denom':denom_rgf}),
+        ]
+    def full_spec(denom_rgf, fuelvals):
+        spec=[]
+        for van in vanset: spec+=specfor(van,denom_rgf,fuelvals)
+        return shift_spec(spec, off)
+    ncol=C('Q')+off; ps=pct_set(full_spec({},['CNG'])); set_ztb(ztb_set(full_spec({},['CNG'])))
+    setcell(ws,'A1','区域范围',merge='A1:A4')
+    setc(ws,'A1',f'{P}风景G系列市场情况',off,merge='A1:Q1')
+    setc(ws,'A2','燃料种类',off,merge='A2:A4'); setc(ws,'B2','企业品牌',off,merge='B2:B4')
+    setc(ws,'C2','欧系中VAN',off,merge='C2:G2'); setc(ws,'H2','日系大VAN',off,merge='H2:L2'); setc(ws,'M2','日系中VAN',off,merge='M2:Q2')
+    setc(ws,'C3',PY,off); setc(ws,'D3',P,off,merge='D3:G3')
+    setc(ws,'H3',PY,off); setc(ws,'I3',P,off,merge='I3:L3')
+    setc(ws,'M3',PY,off); setc(ws,'N3',P,off,merge='N3:Q3')
+    h4=['销量','销量','同比','占有率','占同比','销量','销量','同比','占有率','占同比','销量','销量','同比','占有率','占同比']
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(3+off+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+    def block(rgf0,label,total_label,r):
+        set_region(rgf0); engine.BASE={}
+        base3=CUR[CUR['VAN种类'].isin(vanset)]
+        data_rs=r
+        for fname,fvals in fuel_map.items():
+            ff={FUEL:fvals}; f_rs=r
+            present=sub(base3,ff)
+            bs=[b for b,v in present.groupby('企业品牌')['数量'].sum().sort_values(ascending=False).items() if v>0]
+            if not bs and ssum(Y25, {**ff,'VAN种类':vanset})<=0:
+                continue
+            for b in bs:
+                write_row(ws,r,[(2+off,b)],build_values(full_spec(ff,fvals), ff, b),ps,ncol); r+=1
+            write_row(ws,r,[(1+off,f'{fname} 汇总')],build_values(full_spec(ff,fvals), ff, None),ps,ncol,fill=SUBT,bold=True)
+            ws.merge_cells(start_row=r,start_column=1+off,end_row=r,end_column=2+off)
+            if bs:
+                ws.merge_cells(start_row=f_rs,start_column=1+off,end_row=f_rs+len(bs)-1,end_column=1+off)
+                ws.cell(row=f_rs,column=1+off,value=fname).alignment=CEN
+            r+=1
+        if r>data_rs:
+            ws.merge_cells(start_row=data_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=data_rs,column=1,value=label).alignment=CEN
+        allvals=sum(fuel_map.values(),[]); allf={FUEL:allvals}
+        write_row(ws,r,[(1,total_label)],build_values(full_spec(allf,allvals), allf, None),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=2+off)
+        return r+1
+    r=5
+    for label,total_label,rgf0 in REGIONS:
+        r=block(rgf0,label,total_label,r)
+    set_widths(ws,9,8.0,ncol,first_cols=2+off); ws.freeze_panes=_shift('C5',off)
+    set_region({}); engine.BASE={}
+
+def sheet9(ws):
+    off=1
+    K='10类专用'
+    cats=['休闲旅居','工程作业','医疗卫生','运钞押运','警用特种','冷链运输','流动服务','民生服务','检测监测','邮政运输']
+    cats=[c for c in cats if ssum(CUR,{K:c})>0 or ssum(PRE,{K:c})>0]
+    allcats={K:cats}
+
+    # 动态品牌列表：10类专用范围内，按本期总销量降序，保留覆盖累计90%所需品牌；福田不在其中则补至末尾
+    def top90_special():
+        all_brands = brands_by_sales(CUR, allcats)
+        if not all_brands: return []
+        tot = ssum(CUR, allcats)
+        if not tot: return []
+        cum = 0.0; out = []
+        for b in all_brands:
+            v = ssum(CUR, merged(allcats, {'企业品牌': b}))
+            out.append(b); cum += v
+            if cum / tot >= 0.9: break
+        if '福田' not in out and '福田' in all_brands:
+            out.append('福田')
+        return out
+
+    dyn_brands = top90_special()
+
+    BR_ST  = C('E')   # 品牌起始列（无 off）
+    LAST   = (BR_ST + len(dyn_brands)*5 - 1) if dyn_brands else C('D')
+    ncol   = LAST + off
+
+    def specfor(parent_rgf):
+        s = [(C('B'),'销量',{}),(C('C'),'同比',{}),(C('D'),'比重',{},{'denom':parent_rgf})]
+        for i,b in enumerate(dyn_brands):
+            cb = BR_ST + i*5
+            s += [(cb,'销量',{},{'brand':b}),(cb+1,'同比',{},{'brand':b}),
+                  (cb+2,'比重',{},{'brand':b,'denom':parent_rgf}),
+                  (cb+3,'占有率',{},{'brand':b}),(cb+4,'占同比',{},{'brand':b})]
+        return shift_spec(s, off)
+
+    ps=pct_set(specfor({})); set_ztb(ztb_set(specfor({})))
+
+    def GL(c): return get_column_letter(c)
+
+    setcell(ws,'A1','区域范围',merge='A1:A3')
+    setc(ws,'A1',f'{P}专用类市场情况',off,merge=f'A1:{GL(LAST)}1')
+    setc(ws,'A2','10类专用',off,merge='A2:A3')
+    setc(ws,'B2','汇总',off,merge='B2:D2')
+    for i,b in enumerate(dyn_brands):
+        cb = BR_ST + i*5
+        setc(ws,f'{GL(cb)}2',b,off,merge=f'{GL(cb)}2:{GL(cb+4)}2')
+    h3 = ['销量','同比','比重']+['销量','同比','比重','占有率','占同比']*len(dyn_brands)
+    for i,v in enumerate(h3): setcell(ws,f'{get_column_letter(2+off+i)}3',v,fill=HDR2)
+    style_header_block(ws,1,3,1,ncol)
+
+    def block(rgf0,label,total_label,r):
+        set_region(rgf0); engine.BASE={}; data_rs=r
+        for cat in cats:
+            write_row(ws,r,[(1+off,cat)],build_values(specfor(allcats),{K:cat},None),ps,ncol); r+=1
+        if r>data_rs:
+            ws.merge_cells(start_row=data_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=data_rs,column=1,value=label).alignment=CEN
+        write_row(ws,r,[(1,total_label)],build_values(specfor(allcats),allcats,None),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=1+off)
+        return r+1
+    r=4
+    for label,total_label,rgf0 in REGIONS:
+        r=block(rgf0,label,total_label,r)
+    set_widths(ws,10,8.0,ncol,first_cols=1+off); ws.freeze_panes=_shift('B4',off)
+    set_region({}); engine.BASE={}
+
+def sheet10(ws):
+    # 风景T7微卡市场：独立的微卡底表（字段已重命名为通用列名）。
+    # 区域范围自动判断：多省→整体+各省；单省→整体+该省各地级市。
+    MK = pd.read_excel('微卡底表.xlsx', sheet_name=0)
+    if '燃料种类' in MK.columns and '燃料种类修正' in MK.columns:
+        MK = MK.drop(columns=['燃料种类'])
+    MK = MK.rename(columns={'汇总':'数量','使用城市':'城市','燃料种类修正':'燃料种类'})
+    maxy=int(pd.to_numeric(MK['年份'],errors='coerce').max()); miny=maxy-1
+    _cm=pd.to_numeric(MK.loc[pd.to_numeric(MK['年份'],errors='coerce')==maxy,'月份'],errors='coerce').dropna().astype(int)
+    maxm=int(_cm.max()) if len(_cm) else 12
+    P10=f'{maxy}年1-{maxm}月'; PY10=f'{miny}全年'
+    Dm=MK[pd.to_numeric(MK['月份'],errors='coerce').between(1,maxm)]
+    cur=Dm[pd.to_numeric(Dm['年份'],errors='coerce')==maxy].copy()
+    pre=Dm[pd.to_numeric(Dm['年份'],errors='coerce')==miny].copy()
+    y25=MK[pd.to_numeric(MK['年份'],errors='coerce')==miny].copy()
+    use_dataset(cur,pre,y25)   # 之后 CUR0/PRE0/Y250 = 微卡全量帧
+    def _rank(frame,col,within=None):
+        fr=frame
+        if within:
+            for k,v in within.items(): fr=fr[fr[k]==v]
+        g=fr.groupby(col)['数量'].sum().sort_values(ascending=False)
+        return [x for x,v in g.items() if v>0 and pd.notna(x) and str(x).strip()!='']
+    provs=_rank(cur,'省份')
+    if len(provs)<=1:   # 单省：细分到地级市
+        bp=provs[0] if provs else None
+        subs=_rank(cur,'城市',{'省份':bp}) if bp else _rank(cur,'城市')
+        regions=[('整体','总计',{})]+[(c,f'{c} 汇总',{'城市':c}) for c in subs]
+    else:               # 多省：细分到省份
+        regions=[('整体','总计',{})]+[(p,f'{p} 汇总',{'省份':p}) for p in provs]
+    engine.BASE={}
+    TON25={'吨级':'2.5T'}; TON35={'吨级':'3.5T'}
+    PB={'上装结构':'平板'}; XC={'上装结构':'厢车'}; LL={'上装结构':'冷链车'}
+    def specfor():
+        return [
+            (C('D'),'销量',{},{'curF':Y25}),(C('E'),'占有率',{},{'curF':Y25}),
+            (C('F'),'销量',{}),(C('G'),'同比',{}),(C('H'),'占有率',{}),(C('I'),'占同比',{}),
+            (C('J'),'销量',TON25),(C('K'),'同比',TON25),(C('L'),'占有率',TON25),(C('M'),'占同比',TON25),
+            (C('N'),'销量',TON35),(C('O'),'同比',TON35),(C('P'),'占有率',TON35),(C('Q'),'占同比',TON35),
+            (C('R'),'销量',PB),(C('S'),'同比',PB),(C('T'),'占有率',PB),(C('U'),'占同比',PB),
+            (C('V'),'销量',XC),(C('W'),'同比',XC),(C('X'),'占有率',XC),(C('Y'),'占同比',XC),
+            (C('Z'),'销量',LL),(C('AA'),'同比',LL),(C('AB'),'占有率',LL),
+        ]
+    ncol=C('AB'); ps=pct_set(specfor()); set_ztb(ztb_set(specfor()))
+    def pctlabel(num,den): return f'{round(num/den*100,1):g}%' if den else '0%'
+    tot=ssum(CUR0,{})  # 表头括号内占比：各吨位/上装结构在「整体本期」中的销量占比
+    t25=pctlabel(ssum(CUR0,TON25),tot); t35=pctlabel(ssum(CUR0,TON35),tot)
+    pb=pctlabel(ssum(CUR0,PB),tot); xc=pctlabel(ssum(CUR0,XC),tot); ll=pctlabel(ssum(CUR0,LL),tot)
+    setcell(ws,'A1','区域范围',merge='A1:A4')
+    setcell(ws,'B1',f'{P10}风景T7市场情况',merge='B1:AB1')
+    setcell(ws,'B2','燃料种类',merge='B2:B4'); setcell(ws,'C2','企业品牌',merge='C2:C4')
+    setcell(ws,'D2','汇总',merge='D2:I2'); setcell(ws,'J2','分吨位',merge='J2:Q2'); setcell(ws,'R2','分上装结构',merge='R2:AB2')
+    setcell(ws,'D3',PY10,merge='D3:E3'); setcell(ws,'F3',P10,merge='F3:I3')
+    setcell(ws,'J3',f'2.5T（{t25}）',merge='J3:M3'); setcell(ws,'N3',f'3.5T（{t35}）',merge='N3:Q3')
+    setcell(ws,'R3',f'平板（{pb}）',merge='R3:U3'); setcell(ws,'V3',f'厢车（{xc}）',merge='V3:Y3'); setcell(ws,'Z3',f'冷链车（{ll}）',merge='Z3:AB3')
+    h4=['销量','占有率']+['销量','同比','占有率','占同比']*5+['销量','同比','占有率']
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(4+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+    def block(rgf0,label,total_label,r):
+        set_region(rgf0); data_rs=r
+        for fuel in _rank(CUR,'燃料种类'):
+            ff={'燃料种类':fuel}; f_rs=r
+            bs=brands_by_sales(CUR,ff)
+            for b in bs:
+                write_row(ws,r,[(3,b)],build_values(specfor(),ff,b,denom_rgf={}),ps,ncol); r+=1
+            write_row(ws,r,[(2,f'{fuel} 汇总')],build_values(specfor(),ff,None,denom_rgf={}),ps,ncol,fill=SUBT,bold=True)
+            ws.merge_cells(start_row=r,start_column=2,end_row=r,end_column=3)
+            if bs:
+                ws.merge_cells(start_row=f_rs,start_column=2,end_row=f_rs+len(bs)-1,end_column=2)
+                ws.cell(row=f_rs,column=2,value=fuel).alignment=CEN
+            r+=1
+        if r>data_rs:
+            ws.merge_cells(start_row=data_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=data_rs,column=1,value=label).alignment=CEN
+        write_row(ws,r,[(1,total_label)],build_values(specfor(),{},None,denom_rgf={}),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=3)
+        return r+1
+    r=5
+    for label,total_label,rgf0 in regions:
+        r=block(rgf0,label,total_label,r)
+    set_widths(ws,9,8.0,ncol,first_cols=3); ws.freeze_panes='D5'
+    use_dataset(CUR_VAN, PRE_VAN, Y25_VAN)  # 还原 VAN 数据集
+
+s1=wb.active; s1.title='sheet1'; sheet1(s1)
+sheet2(wb.create_sheet('sheet2'))
+sheet3(wb.create_sheet('sheet3'))
+sheet4(wb.create_sheet('sheet4'))
+sheet5(wb.create_sheet('sheet5'))
+sheet6(wb.create_sheet('sheet6'))
+sheet7(wb.create_sheet('sheet7'))
+sheet8(wb.create_sheet('sheet8'))
+sheet9(wb.create_sheet('sheet9'))
+if globals().get('HAS_MK'):
+    sheet10(wb.create_sheet('sheet10'))
+OUTNAME=f'{MAXY}年1-{MAXM}月分析结果.xlsx'
+wb.save(OUTNAME)
+RESULT_FILE=OUTNAME
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<style>
+  :root{
+    --bg:#f4f6fb; --panel:#ffffff; --line:#dfe4ee; --line2:#eef1f7;
+    --ink:#1f2733; --ink2:#5b6675; --muted:#8a94a6;
+    --blue:#2f6df5; --blue-d:#1f54c9; --blue-soft:#eaf1ff;
+    --green:#1f9d6b; --green-soft:#e6f6ee;
+    --amber:#caa12a; --amber-soft:#fcf3d6;
+    --radius:12px; --shadow:0 1px 3px rgba(20,30,60,.06),0 6px 24px rgba(20,30,60,.05);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Segoe UI,Roboto,sans-serif;
+    background:var(--bg); color:var(--ink); font-size:14px; line-height:1.55;
+  }
+  .app{display:flex; flex-direction:column; height:100vh; overflow:hidden}
+  /* ---------- top bar ---------- */
+  .topbar{
+    display:flex; align-items:center; gap:14px; padding:12px 20px;
+    background:var(--panel); border-bottom:1px solid var(--line); flex:0 0 auto;
+  }
+  .topbar h1{font-size:16px; margin:0; font-weight:700; letter-spacing:.3px}
+  .topbar .sub{color:var(--muted); font-size:12px}
+  .topbar .spacer{flex:1}
+  .badge{font-size:12px; padding:3px 10px; border-radius:20px; background:var(--line2); color:var(--ink2)}
+  .badge.ok{background:var(--green-soft); color:var(--green)}
+  .iconbtn{
+    border:1px solid var(--line); background:#fff; color:var(--ink2); font-size:12px;
+    padding:6px 12px; border-radius:8px; cursor:pointer;
+  }
+  .iconbtn:hover{background:var(--blue-soft); border-color:var(--blue); color:var(--blue-d)}
+  /* ---------- layout ---------- */
+  .main{display:flex; gap:0; padding:14px; flex:1; min-height:0}
+  .left{display:flex; flex-direction:column; min-height:0; width:var(--left-w,330px); flex:0 0 auto}
+  .right{display:flex; flex-direction:column; min-height:0; flex:1 1 0; min-width:0}
+  .stack{display:flex; flex-direction:column; gap:12px; flex:0 0 auto; overflow:auto; min-height:0; height:var(--lefttop-h,auto)}
+  /* ---------- drag splitters ---------- */
+  .rz{flex:0 0 auto; position:relative; z-index:5}
+  .rz-v{width:14px; cursor:col-resize; align-self:stretch}
+  .rz-h{height:14px; cursor:row-resize}
+  .rz::before{content:''; position:absolute; background:transparent; border-radius:6px; transition:background .15s}
+  .rz-v::before{top:0; bottom:0; left:5px; width:4px}
+  .rz-h::before{left:0; right:0; top:5px; height:4px}
+  .rz:hover::before,.rz.active::before{background:var(--blue)}
+  .rz::after{content:''; position:absolute; border-radius:3px; background:var(--line); opacity:.9}
+  .rz-v::after{top:50%; left:6px; width:2px; height:26px; margin-top:-13px}
+  .rz-h::after{left:50%; top:6px; height:2px; width:26px; margin-left:-13px}
+  .rz:hover::after{background:var(--blue)}
+  body.dragging{user-select:none; cursor:inherit}
+  body.dragging *{pointer-events:none}
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    box-shadow:var(--shadow); display:flex; flex-direction:column; min-height:0;
+  }
+  /* compact upload cards never grow; chat card takes all remaining height */
+  .card.compact{flex:0 0 auto}
+  .card.grow{flex:1 1 auto; min-height:0}
+  .card .hd{
+    padding:9px 13px; border-bottom:1px solid var(--line2); font-weight:600; font-size:13px;
+    display:flex; align-items:center; gap:8px; color:var(--ink); cursor:default;
+  }
+  .card .hd .num{
+    width:20px; height:20px; border-radius:6px; background:var(--blue-soft); color:var(--blue-d);
+    font-size:12px; display:flex; align-items:center; justify-content:center; font-weight:700;
+  }
+  .card .hd .tag{margin-left:auto; font-size:11px; color:var(--muted); font-weight:500}
+  .card .hd .caret{margin-left:6px; color:var(--muted); font-size:11px; transition:transform .15s}
+  .card.collapsed .caret{transform:rotate(-90deg)}
+  .card.collapsed .bd{display:none}
+  .card .bd{padding:12px; overflow:auto}
+  /* ---------- dropzone (compact bar) ---------- */
+  .drop{
+    border:1.5px dashed var(--line); border-radius:9px; padding:10px 12px; cursor:pointer; transition:.15s;
+    background:#fcfdff; display:flex; align-items:center; gap:10px; text-align:left;
+  }
+  .drop:hover,.drop.drag{border-color:var(--blue); background:var(--blue-soft)}
+  .drop .big{font-size:20px; line-height:1; flex:0 0 auto}
+  .drop .txt{flex:1; min-width:0}
+  .drop .t{font-weight:600; font-size:12.5px}
+  .drop .s{color:var(--muted); font-size:11px; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .fileinfo{
+    margin-top:8px; font-size:12px; background:var(--green-soft); color:var(--green);
+    border-radius:8px; padding:6px 9px; display:none; align-items:center; gap:8px; word-break:break-all;
+  }
+  .fileinfo.show{display:flex}
+  .meta{margin-top:8px; font-size:12px; color:var(--ink2)}
+  .meta b{color:var(--ink)}
+  .chips{display:flex; flex-wrap:wrap; gap:5px; margin-top:8px}
+  .chip{font-size:11px; background:var(--line2); border-radius:6px; padding:2px 7px; color:var(--ink2)}
+
+  /* ---------- responsive: allow scrolling instead of squishing ---------- */
+  @media (max-height:640px), (max-width:860px){
+    .app{height:auto; min-height:100vh; overflow:visible}
+    .main{height:auto}
+    .left .card.grow{min-height:420px}
+  }
+  @media (max-width:860px){
+    .main{grid-template-columns:1fr}
+  }
+  /* ---------- chart type tabs ---------- */
+  .typebar{display:flex; gap:8px; flex-wrap:wrap; align-items:center}
+  .ttab{
+    border:1px solid var(--line); background:#fff; padding:8px 16px; border-radius:9px; cursor:pointer;
+    font-weight:600; font-size:13px; color:var(--ink2); display:flex; gap:7px; align-items:center; position:relative;
+  }
+  .ttab:hover{border-color:var(--blue)}
+  .ttab.active{background:var(--blue); border-color:var(--blue); color:#fff; box-shadow:0 4px 12px rgba(47,109,245,.3)}
+  .ttab .dot{width:7px; height:7px; border-radius:50%; background:var(--amber)}
+  .ttab.active .dot{background:#fff}
+  .ttab.ready .dot{background:var(--green)}
+  /* ---------- chat ---------- */
+  .chat{flex:1; display:flex; flex-direction:column; min-height:0}
+  .chatlog{flex:1; overflow:auto; padding:12px; display:flex; flex-direction:column; gap:10px; background:#fbfcfe}
+  .msg{max-width:88%; padding:9px 12px; border-radius:12px; font-size:13px; white-space:pre-wrap; word-break:break-word}
+  .msg.bot{align-self:flex-start; background:#fff; border:1px solid var(--line)}
+  .msg.user{align-self:flex-end; background:var(--blue); color:#fff}
+  .msg.sys{align-self:center; background:var(--amber-soft); color:var(--amber); font-size:12px; border-radius:8px; max-width:95%}
+  .msg .who{font-size:10px; opacity:.6; margin-bottom:2px; font-weight:600}
+  .chatin{display:flex; gap:8px; padding:10px; border-top:1px solid var(--line2); background:#fff}
+  .chatin textarea{
+    flex:1; resize:none; border:1px solid var(--line); border-radius:9px; padding:8px 10px; font-family:inherit;
+    font-size:13px; height:40px; max-height:120px;
+  }
+  .chatin textarea:focus{outline:none; border-color:var(--blue)}
+  .sendbtn{
+    border:none; background:var(--blue); color:#fff; border-radius:9px; padding:0 16px; cursor:pointer; font-weight:600;
+  }
+  .sendbtn:hover{background:var(--blue-d)}
+  .sendbtn:disabled{opacity:.5; cursor:default}
+  /* ---------- output ---------- */
+  .outhead{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+  .outhead .spacer{flex:1}
+  select,input[type=text]{
+    border:1px solid var(--line); border-radius:8px; padding:6px 9px; font-family:inherit; font-size:13px; background:#fff;
+  }
+  select:focus,input:focus{outline:none; border-color:var(--blue)}
+  .btn{border:1px solid var(--line); background:#fff; padding:6px 13px; border-radius:8px; cursor:pointer; font-size:13px; color:var(--ink2)}
+  .btn:hover{border-color:var(--blue); color:var(--blue-d); background:var(--blue-soft)}
+  .btn.primary{background:var(--blue); color:#fff; border-color:var(--blue)}
+  .btn.primary:hover{background:var(--blue-d)}
+  .btn.green{background:var(--green); color:#fff; border-color:var(--green)}
+  .outbody{flex:1; overflow:auto; padding:16px; min-height:0}
+  .placeholder{height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; color:var(--muted); text-align:center; gap:8px}
+  .placeholder .big{font-size:42px}
+  table.res{border-collapse:collapse; width:100%; font-size:12.5px}
+  table.res th,table.res td{border:1px solid var(--line); padding:5px 9px; text-align:center; white-space:nowrap}
+  table.res th{background:var(--blue-soft); color:var(--ink); position:sticky; top:0}
+  table.res tr:nth-child(even) td{background:#fafbfe}
+  .chartwrap{position:relative; height:100%; min-height:380px}
+  .hint{font-size:12px; color:var(--muted); margin-top:6px}
+  .row{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+  .lbl{font-size:12px; color:var(--ink2); font-weight:600}
+  .divider{height:1px; background:var(--line2); margin:10px 0}
+  .modal-bg{position:fixed; inset:0; background:rgba(20,30,60,.4); display:none; align-items:center; justify-content:center; z-index:50}
+  .modal-bg.show{display:flex}
+  .modal{background:#fff; border-radius:14px; width:460px; max-width:92vw; padding:20px; box-shadow:var(--shadow)}
+  .modal h3{margin:0 0 8px}
+  .modal p{color:var(--ink2); font-size:13px; margin:6px 0}
+  .modal input{width:100%; margin:8px 0}
+  .small{font-size:11px; color:var(--muted)}
+  a{color:var(--blue-d)}
+  /* report preview */
+  .sheettabs{display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px}
+  .stab{border:1px solid var(--line); background:#fff; padding:4px 12px; border-radius:7px; cursor:pointer; font-size:12px; color:var(--ink2)}
+  .stab.active{background:var(--blue); color:#fff; border-color:var(--blue)}
+  .reportbox{overflow:auto}
+  .pybar{display:flex; align-items:center; gap:8px; font-size:12px; color:var(--ink2); margin-bottom:8px}
+  .spin{width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--blue);border-radius:50%;display:inline-block;animation:sp 0.8s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .applycard{background:var(--blue-soft);border:1px solid var(--blue);border-radius:8px;padding:6px 9px;font-size:12px;margin-top:6px;cursor:pointer}
+  .applycard:hover{background:#dde9ff}</style>
+</head>
+<body>
+<div class="app">
+  <!-- ============ TOP BAR ============ -->
+  <div class="topbar">
+    <h1>VAN类车上险销量 · 月度分析工作流</h1>
+    <span class="sub">西北五省 · 每月增量复用模板</span>
+    <span class="spacer"></span>
+    <span class="badge" id="periodBadge">未识别统计期间</span>
+    <button class="iconbtn" id="aiBtn">⚙ AI助手设置</button>
+    <button class="iconbtn" id="resetBtn">清空全部</button>
+  </div>
+
+  <div class="main">
+    <!-- ============ LEFT COLUMN ============ -->
+    <div class="left">
+     <div class="stack" id="leftTop">
+      <!-- 1. base table -->
+      <div class="card compact" id="baseCard">
+        <div class="hd" data-collapse="baseCard"><span class="num">1</span>数据底表上传窗口<span class="tag">全局共用</span><span class="caret">▾</span></div>
+        <div class="bd">
+          <div class="drop" id="baseDrop">
+            <div class="big">📊</div>
+            <div class="txt">
+              <div class="t">上传上险数据底表</div>
+              <div class="s">拖拽或点击 · .xlsx / .xls / .csv</div>
+            </div>
+          </div>
+          <input type="file" id="baseFile" accept=".xlsx,.xls,.csv" hidden>
+          <div class="fileinfo" id="baseInfo"></div>
+          <div class="meta" id="baseMeta"></div>
+          <div class="chips" id="baseChips"></div>
+        </div>
+      </div>
+
+      <!-- 1b. micro-truck base table (sheet10) -->
+      <div class="card compact" id="baseMKCard">
+        <div class="hd" data-collapse="baseMKCard"><span class="num">+</span>微卡数据底表（sheet10）<span class="tag">风景T7市场</span><span class="caret">▾</span></div>
+        <div class="bd">
+          <div class="drop" id="baseMKDrop">
+            <div class="big">🚚</div>
+            <div class="txt">
+              <div class="t">上传微卡上险数据底表</div>
+              <div class="s">选填 · 上传后报告自动追加 sheet10</div>
+            </div>
+          </div>
+          <input type="file" id="baseMKFile" accept=".xlsx,.xls,.csv" hidden>
+          <div class="fileinfo" id="baseMKInfo"></div>
+          <div class="meta" id="baseMKMeta"></div>
+        </div>
+      </div>
+
+      <!-- 2. template upload (per type) -->
+      <div class="card compact" id="tplCard">
+        <div class="hd" data-collapse="tplCard"><span class="num">2</span>模板上传窗口<span class="tag" id="tplTypeTag">饼状图</span><span class="caret">▾</span></div>
+        <div class="bd">
+          <div class="drop" id="tplDrop">
+            <div class="big">📑</div>
+            <div class="txt">
+              <div class="t">上传当前图表类型的模板</div>
+              <div class="s">随图表类型切换 · 各类型独立</div>
+            </div>
+          </div>
+          <input type="file" id="tplFile" accept=".xlsx,.xls,.csv,.png,.jpg,.jpeg,.pdf" hidden>
+          <div class="fileinfo" id="tplInfo"></div>
+        </div>
+      </div>
+     </div>
+
+      <!-- splitter: upload area ↕ chat -->
+      <div class="rz rz-h" data-rz="leftV" title="拖动调节上下高度"></div>
+
+      <!-- 3. chat (per type) — dominant -->
+      <div class="card grow" id="chatCard">
+        <div class="hd"><span class="num">3</span>用户与系统交流窗口<span class="tag" id="chatTypeTag">饼状图</span></div>
+        <div class="chat">
+          <div class="chatlog" id="chatlog"></div>
+          <div class="chatin">
+            <textarea id="chatInput" placeholder="说明此图表的分析逻辑与要求…（回车发送，Shift+回车换行）"></textarea>
+            <button class="sendbtn" id="sendBtn">发送</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- splitter: left ↔ right -->
+    <div class="rz rz-v" data-rz="leftWidth" title="拖动调节左右宽度"></div>
+
+    <!-- ============ RIGHT COLUMN ============ -->
+    <div class="right">
+      <!-- chart type selector -->
+      <div class="card compact" id="typeCard">
+        <div class="hd">数据分析图表类型选择窗口<span class="tag">数据表 · 饼状图 · 柱状图 · 折线图等</span></div>
+        <div class="bd">
+          <div class="typebar" id="typebar"></div>
+        </div>
+      </div>
+
+      <!-- splitter: type-select ↕ output -->
+      <div class="rz rz-h" data-rz="rightV" title="拖动调节上下高度"></div>
+
+      <!-- output -->
+      <div class="card grow" id="outCard">
+        <div class="hd outhead">
+          <span>图表输出窗口</span>
+          <span class="spacer"></span>
+          <span class="lbl" id="dimLbl">维度</span>
+          <select id="dimSel"></select>
+          <span class="lbl" id="metricLbl">指标</span>
+          <select id="metricSel"></select>
+          <span class="lbl" id="s3Lbl">Sheet3</span>
+          <select id="s3Mode" title="Sheet3 分析口径：分省 / 分城市">
+            <option value="auto">Sheet3 自动</option>
+            <option value="province">Sheet3 分省</option>
+            <option value="city">Sheet3 分城市</option>
+          </select>
+          <select id="s3Prov" title="分城市模式下分析哪个省份" style="display:none"></select>
+          <button class="btn primary" id="genBtn">生成分析</button>
+          <button class="btn green" id="exportBtn">导出</button>
+        </div>
+        <div class="outbody" id="outbody">
+          <div class="placeholder">
+            <div class="big">📈</div>
+            <div>上传数据底表后：「数据表」一键生成完整 9-sheet 报告；饼/柱/折线选维度即时出图</div>
+            <div class="small">结果可在此预览，并直接导出（报告→Excel，图表→PNG）</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- AI settings modal -->
+<div class="modal-bg" id="aiModal">
+  <div class="modal">
+    <h3>AI 助手设置（可选）</h3>
+    <p>填入 Claude API Key 后，交流窗口会像我们这次分析 1-4 月那样<b>主动提出口径细节问题</b>，并据此理解你的分析需求。</p>
+    <p class="small">不填也能用：交流窗口进入「手动模式」，按内置的西北五省 VAN 分析口径清单逐项与你确认。Key 仅保存在本机浏览器（localStorage），不上传到任何第三方。</p>
+    <input type="text" id="apiKey" placeholder="sk-ant-... （留空则使用手动模式）">
+    <input type="text" id="apiModel" placeholder="模型（默认 claude-opus-4-8）">
+    <div class="row" style="justify-content:flex-end; margin-top:10px">
+      <button class="btn" id="aiCancel">取消</button>
+      <button class="btn primary" id="aiSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =================================================================
+   月度分析工作流 — 单文件应用 (v2)
+   - 底表全局共用；模板+对话按图表类型隔离
+   - 「数据表」类型 = 在浏览器内用 Pyodide 运行项目原版 build.py，
+     生成与本地完全一致的 9-sheet 报告（口径零漂移），并随月份自动扩展
+   - 饼/柱/折线 = JS 引擎按所选维度即时出图
+   - 交流窗口接入 Claude，可真实对话并驱动维度/指标/筛选
+   ================================================================= */
+const $ = s => document.querySelector(s);
+const LS = 'van_workflow_v2';
+
+const CHART_TYPES = [
+  {key:'table', name:'数据表(9-sheet报告)', icon:'▦'},
+  {key:'pie',   name:'饼状图', icon:'◔'},
+  {key:'bar',   name:'柱状图', icon:'▥'},
+  {key:'line',  name:'折线图', icon:'∿'},
+];
+
+let state = {
+  base:null,            // {name, rows, cols, period, bytes(Uint8Array)}
+  baseMK:null,          // 微卡底表 {name, bytes, period, rows} —— sheet10 专用
+  activeType:'table',
+  types:{},             // perType: {tpl, chat:[{role,text}]}
+  ai:{key:'', model:'claude-opus-4-8'},
+};
+CHART_TYPES.forEach(t=>state.types[t.key]={tpl:null, chat:[]});
+
+/* ---------- persistence (chat/tpl/ai only; base re-uploaded each session) ---------- */
+function save(){
+  try{
+    const slim={activeType:state.activeType, ai:state.ai, types:{}};
+    CHART_TYPES.forEach(t=>slim.types[t.key]={tpl:state.types[t.key].tpl, chat:state.types[t.key].chat});
+    slim.baseHint = state.base?{name:state.base.name, period:state.base.period, count:state.base.rows.length}:state._baseHint||null;
+    localStorage.setItem(LS, JSON.stringify(slim));
+  }catch(e){}
+}
+function load(){
+  try{
+    const s=JSON.parse(localStorage.getItem(LS)||'null'); if(!s) return;
+    state.activeType=s.activeType||'table'; state.ai=s.ai||state.ai;
+    if(s.types) CHART_TYPES.forEach(t=>{ if(s.types[t.key]) state.types[t.key]={tpl:s.types[t.key].tpl||null, chat:s.types[t.key].chat||[]}; });
+    if(s.baseHint) state._baseHint=s.baseHint;
+  }catch(e){}
+}
+
+/* ================= column resolution ================= */
+const COL_ALIASES = {
+  '数量':['数量','销量','上险数','台数','量'], '年份':['年份','年'], '月份':['月份','月'],
+  '省份':['省份','省'], '城市':['城市','市'], '企业品牌':['企业品牌','品牌','厂家','企业'],
+  '大中VAN':['大中VAN','大中van','车型分类'], '燃料种类':['燃料种类','燃料'], '燃料种类2':['燃料种类2','能源类型'],
+  '功能分类2':['功能分类2','功能分类','功能'], '米段（轴距划分）':['米段（轴距划分）','米段','轴距'],
+  '窗':['窗','明盲窗'], '10类专用':['10类专用','专用'], 'VAN种类':['VAN种类','van种类'], '容积段（新）':['容积段（新）','容积段','容积'],
+};
+function resolveCol(cols, c){
+  const al=COL_ALIASES[c]||[c];
+  for(const a of al){const h=cols.find(x=>String(x).trim()===a); if(h) return h;}
+  for(const a of al){const h=cols.find(x=>String(x).includes(a)); if(h) return h;}
+  return null;
+}
+
+/* ================= BASE TABLE ================= */
+// 与 Python core.py 的 PROVINCES 一致：按本期销量降序取底表实际省份
+function detectProvinces(rows,cols,yCol,mCol){
+  const pCol=resolveCol(cols,'省份'), qCol=resolveCol(cols,'数量');
+  if(!pCol) return [];
+  let cy=null,cyMonths=null;
+  if(yCol){ const ys=[...new Set(rows.map(r=>Number(r[yCol])).filter(n=>!isNaN(n)))]; cy=Math.max(...ys);
+    cyMonths=new Set(rows.filter(r=>Number(r[yCol])===cy).map(r=>Number(r[mCol]))); }
+  const agg={};
+  rows.forEach(r=>{ const p=r[pCol]; if(p==null||String(p).trim()==='') return;
+    const inCur = !yCol || (Number(r[yCol])===cy && (!mCol||cyMonths.has(Number(r[mCol]))));
+    if(!inCur) return; agg[p]=(agg[p]||0)+(Number(r[qCol])||0); });
+  let provs=Object.keys(agg).filter(p=>agg[p]>0).sort((a,b)=>agg[b]-agg[a]);
+  if(!provs.length){ // 本期无量则退回全表
+    const all={}; rows.forEach(r=>{const p=r[pCol]; if(p==null||String(p).trim()==='')return; all[p]=(all[p]||0)+(Number(r[qCol])||0);});
+    provs=Object.keys(all).filter(p=>all[p]>0).sort((a,b)=>all[b]-all[a]);
+  }
+  return provs;
+}
+function handleBase(file){
+  const reader=new FileReader();
+  reader.onload=e=>{
+    try{
+      const bytes=new Uint8Array(e.target.result);
+      const wb=XLSX.read(bytes,{type:'array'});
+      const ws=wb.Sheets[wb.SheetNames[0]];
+      const rows=XLSX.utils.sheet_to_json(ws,{defval:null});
+      if(!rows.length){ alert('底表为空'); return; }
+      const cols=Object.keys(rows[0]);
+      const yCol=resolveCol(cols,'年份'), mCol=resolveCol(cols,'月份');
+      let period='';
+      if(yCol&&mCol){
+        const years=[...new Set(rows.map(r=>Number(r[yCol])).filter(n=>!isNaN(n)))];
+        const cy=Math.max(...years);
+        const cyMonths=[...new Set(rows.filter(r=>Number(r[yCol])===cy).map(r=>Number(r[mCol])))].filter(n=>!isNaN(n)).sort((a,b)=>a-b);
+        if(cyMonths.length) period=`${cy}年${cyMonths[0]}-${cyMonths[cyMonths.length-1]}月`;
+      }
+      // 识别底表中实际出现的省份（按本期销量降序），供 Sheet3 分城市模式选择
+      const provinces=detectProvinces(rows,cols,yCol,mCol);
+      state.base={name:file.name, rows, cols, bytes, period, provinces};
+      state._baseHint=null; pyReportCache=null;
+      renderBase(); rebuildSelectors(); save();
+      $('#baseCard').classList.add('collapsed');
+      pushSys(`已读取底表「${file.name}」，共 ${rows.length} 行，识别统计期间：${period||'未识别'}。\n· 「数据表」类型 → 一键生成完整 9-sheet 报告（口径与本地脚本一致，随月份自动扩展）\n· 饼/柱/折线 → 选维度即时出图。`);
+    }catch(err){ alert('解析失败：'+err.message); }
+  };
+  reader.readAsArrayBuffer(file);
+}
+function renderBase(){
+  const b=state.base, info=$('#baseInfo'), meta=$('#baseMeta'), chips=$('#baseChips'), badge=$('#periodBadge');
+  if(!b){
+    info.classList.remove('show'); meta.innerHTML=''; chips.innerHTML='';
+    if(state._baseHint){ meta.innerHTML=`<span style="color:var(--amber)">⚠ 上次用过「${state._baseHint.name}」(${state._baseHint.count}行)，请重新上传。</span>`; badge.textContent=state._baseHint.period||'未识别统计期间'; }
+    return;
+  }
+  info.className='fileinfo show'; info.innerHTML=`✓ ${b.name} · ${b.rows.length} 行`;
+  meta.innerHTML=`统计期间：<b>${b.period||'未识别'}</b> · 字段 ${b.cols.length} 个`;
+  badge.textContent=b.period?('统计期间 '+b.period):'未识别统计期间'; badge.className=b.period?'badge ok':'badge';
+  const keyFields=['数量','年份','月份','省份','城市','企业品牌','大中VAN','燃料种类','米段（轴距划分）','功能分类2','窗','10类专用'];
+  chips.innerHTML=keyFields.map(k=>{const h=resolveCol(b.cols,k);return `<span class="chip" style="${h?'background:var(--green-soft);color:var(--green)':'opacity:.5'}">${h?'✓':'—'} ${k}</span>`;}).join('');
+}
+
+/* ================= 微卡底表 (sheet10) ================= */
+function handleBaseMK(file){
+  const reader=new FileReader();
+  reader.onload=e=>{
+    try{
+      const bytes=new Uint8Array(e.target.result);
+      const wb=XLSX.read(bytes,{type:'array'});
+      const ws=wb.Sheets[wb.SheetNames[0]];
+      const rows=XLSX.utils.sheet_to_json(ws,{defval:null});
+      if(!rows.length){ alert('微卡底表为空'); return; }
+      const cols=Object.keys(rows[0]);
+      const yCol=resolveCol(cols,'年份'), mCol=resolveCol(cols,'月份');
+      let period='';
+      if(yCol&&mCol){
+        const years=[...new Set(rows.map(r=>Number(r[yCol])).filter(n=>!isNaN(n)))];
+        const cy=Math.max(...years);
+        const cyMonths=[...new Set(rows.filter(r=>Number(r[yCol])===cy).map(r=>Number(r[mCol])))].filter(n=>!isNaN(n)).sort((a,b)=>a-b);
+        if(cyMonths.length) period=`${cy}年${cyMonths[0]}-${cyMonths[cyMonths.length-1]}月`;
+      }
+      state.baseMK={name:file.name, bytes, period, rows:rows.length, cols};
+      pyReportCache=null;
+      renderBaseMK(); renderTypePanels(); save();
+      $('#baseMKCard').classList.add('collapsed');
+      pushSys(`已读取微卡底表「${file.name}」，共 ${rows.length} 行。生成报告时将自动追加 sheet10（风景T7微卡市场，区域随省份数自动分省/分市）。`);
+    }catch(err){ alert('微卡底表解析失败：'+err.message); }
+  };
+  reader.readAsArrayBuffer(file);
+}
+function renderBaseMK(){
+  const b=state.baseMK, info=$('#baseMKInfo'), meta=$('#baseMKMeta');
+  if(!info) return;
+  if(!b){ info.classList.remove('show'); if(meta) meta.innerHTML=''; return; }
+  info.className='fileinfo show'; info.innerHTML=`✓ ${b.name} · ${b.rows} 行`;
+  if(meta){
+    const need=['年份','月份','使用城市','燃料种类修正','企业品牌','吨级','上装结构','汇总','省份'];
+    const have=k=>b.cols.some(x=>String(x).trim()===k);
+    meta.innerHTML=`统计期间：<b>${b.period||'未识别'}</b><div class="chips">`+
+      need.map(k=>`<span class="chip" style="${have(k)?'background:var(--green-soft);color:var(--green)':'opacity:.5;color:#c0392b'}">${have(k)?'✓':'—'} ${k}</span>`).join('')+`</div>`;
+  }
+}
+
+function renderTabs(){
+  const bar=$('#typebar'); bar.innerHTML='';
+  CHART_TYPES.forEach(t=>{
+    const st=state.types[t.key]; const ready=st.tpl||st.chat.length;
+    const el=document.createElement('div');
+    el.className='ttab'+(state.activeType===t.key?' active':'')+(ready?' ready':'');
+    el.innerHTML=`<span class="dot"></span>${t.icon} ${t.name}`;
+    el.onclick=()=>switchType(t.key); bar.appendChild(el);
+  });
+}
+function switchType(key){ state.activeType=key; renderTabs(); renderTypePanels(); rebuildSelectors(); save(); }
+function curType(){ return CHART_TYPES.find(t=>t.key===state.activeType); }
+function renderTypePanels(){
+  const t=curType(), st=state.types[state.activeType];
+  $('#tplTypeTag').textContent=t.name; $('#chatTypeTag').textContent=t.name;
+  const ti=$('#tplInfo');
+  if(st.tpl){ ti.className='fileinfo show'; ti.innerHTML=`✓ ${st.tpl.name}`; } else { ti.classList.remove('show'); ti.innerHTML=''; }
+  renderChat();
+  // toolbar: table type hides dim/metric selectors (full report), shows them for charts
+  const isTable=state.activeType==='table';
+  $('#dimSel').style.display=isTable?'none':''; $('#metricSel').style.display=isTable?'none':'';
+  $('#dimLbl').style.display=isTable?'none':''; $('#metricLbl').style.display=isTable?'none':'';
+  // sheet3 mode controls: only for 数据表(报告) type
+  $('#s3Lbl').style.display=isTable?'':'none'; $('#s3Mode').style.display=isTable?'':'none';
+  syncS3Controls();
+  $('#genBtn').textContent=isTable?((state.baseMK?'生成10-sheet报告':'生成9-sheet报告')):'生成分析';
+}
+// sheet3 分省/分城市 控件：填充省份下拉、按模式显隐
+function syncS3Controls(){
+  const isTable=state.activeType==='table';
+  const mode=$('#s3Mode').value, provSel=$('#s3Prov');
+  const provs=(state.base&&state.base.provinces)?state.base.provinces:[];
+  if(provSel.dataset.fp!==provs.join('|')){
+    provSel.innerHTML=provs.map(p=>`<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
+    provSel.dataset.fp=provs.join('|');
+  }
+  const showProv=isTable && mode==='city' && provs.length>0;
+  provSel.style.display=showProv?'':'none';
+}
+
+/* ================= TEMPLATE ================= */
+function handleTpl(file){
+  const st=state.types[state.activeType];
+  st.tpl={name:file.name, kind:(file.name.split('.').pop()||'').toLowerCase()};
+  renderTypePanels(); renderTabs(); save();
+  pushBot(`已收到「${curType().name}」模板：${file.name}。\n请说明：这张${curType().name}要呈现哪个维度、用哪个指标、对比口径是什么？我会就细节追问。`);
+}
+
+/* ================= CHAT ================= */
+// 离线引导问答：复刻我们当初规划 1-4 月报告时逐项确认口径的过程，全程无需 API
+const GUIDE_STEPS = [
+  {q:'第1步 · 统计期间：本期取「最新年份所覆盖的连续月份」，同比对照去年同期；另外 sheet5/sheet8 的「去年全年」列单独取去年整年。系统已从底表自动识别本期区间。这个口径沿用吗？（回复：是 / 否+说明）'},
+  {q:'第2步 · 销量定义：销量 = 底表「数量」字段求和，0 值留空不显示。沿用吗？'},
+  {q:'第3步 · 同比规则：同比 = 本期 ÷ 去年同期 − 1；若去年同期为 0 且本期有量，标记为「净增长」。沿用吗？'},
+  {q:'第4步 · 占有率 / 占同比：占有率 = 该项 ÷ 同列条件下所有品牌总销量；占同比 = 本期占有率 − 去年同期占有率。沿用吗？'},
+  {q:'第5步 · 比重（sheet4/6/9）：比重 = 本行销量 ÷ 上一级父分类汇总销量。沿用吗？'},
+  {q:'第6步 · 品牌范围与排序：保留全部有销量品牌，按本期销量降序；福田等标杆品牌单列对比。沿用吗？'},
+  {q:'第7步 · 输出结构：仍按既定 9 个 sheet 输出（①企业品牌总览 ②分省×品牌 ③分省×福田 ④省→城市→燃料 ⑤大VAN场景 ⑥大VAN米段×功能 ⑦中VAN明盲窗 ⑧风景G系列 ⑨10类专用）。沿用吗？'},
+];
+function guideState(){ const st=state.types[state.activeType]; if(!st.guide) st.guide={step:-1, notes:[]}; return st.guide; }
+
+function renderChat(){
+  const log=$('#chatlog'), st=state.types[state.activeType]; log.innerHTML='';
+  if(!st.chat.length){
+    const intro = state.ai.key
+      ? `这里是「${curType().name}」的独立交流窗口（AI已接入）。\n直接说你的分析需求，我会像规划 1-4 月报告时那样追问口径，并能直接帮你设置维度/指标、生成图表。`
+      : `这里是「${curType().name}」的独立交流窗口（未接入 API，离线可用）。\n生成 9-sheet 数据分析表【不需要 API】。你可以：\n· 直接选「数据表」点「生成9-sheet报告」立即出表；\n· 或点下方「开始引导问答」，我按当初分析 1-4 月时的流程逐项跟你确认口径，确认完一键出表。`;
+    appendMsg('bot',intro,true);
+    if(!state.ai.key) appendGuideStart();
+  }
+  st.chat.forEach(m=>appendMsg(m.role,m.text,true));
+  log.scrollTop=log.scrollHeight;
+}
+function appendGuideStart(){
+  const log=$('#chatlog'), card=document.createElement('div');
+  card.className='msg bot';
+  card.innerHTML=`<div class="who">系统助手</div><div class="applycard" onclick="startGuide()">▶ 开始引导问答（复刻 1-4 月分析流程，无需 API）</div>`;
+  log.appendChild(card); log.scrollTop=log.scrollHeight;
+}
+function startGuide(){
+  const g=guideState(); g.step=0; g.notes=[];
+  pushBot('好的，我们按当初分析 1-4 月报告的方式逐项确认口径。\n'+GUIDE_STEPS[0].q);
+}
+function appendMsg(role,text,noStore){
+  const log=$('#chatlog'), el=document.createElement('div');
+  el.className='msg '+(role==='user'?'user':role==='sys'?'sys':'bot');
+  if(role!=='sys') el.innerHTML=`<div class="who">${role==='user'?'我':'系统助手'}</div>`+escapeHtml(text);
+  else el.textContent=text;
+  log.appendChild(el); log.scrollTop=log.scrollHeight;
+  if(!noStore){ state.types[state.activeType].chat.push({role,text}); save(); }
+}
+function pushBot(t,noStore){ appendMsg('bot',t,noStore); }
+function pushUser(t){ appendMsg('user',t); }
+function pushSys(t){ appendMsg('sys',t); }
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+function offerGenerate(){
+  const log=$('#chatlog'), card=document.createElement('div');
+  card.className='msg bot';
+  card.innerHTML=`<div class="who">系统助手</div>口径已逐项确认完毕（与 1-4 月报告一致）。<div class="applycard" onclick="genReport()">▶ 按此口径生成完整 9-sheet 数据分析表</div>`;
+  log.appendChild(card); log.scrollTop=log.scrollHeight;
+}
+// 内联 onclick 调用的辅助函数（函数声明已是全局，state 是 let 不可内联访问，故封装）
+function genReport(){ if(state.activeType!=='table') switchType('table'); generate(); }
+
+async function sendChat(){
+  const inp=$('#chatInput'), text=inp.value.trim(); if(!text) return;
+  pushUser(text); inp.value='';
+  // 离线引导问答进行中：推进到下一步
+  const g=guideState();
+  if(!state.ai.key && g.step>=0 && g.step<GUIDE_STEPS.length){
+    g.notes.push(text); save();
+    const neg=/否|不|改|换|调整/.test(text)&&!/不变|没问题|不用改/.test(text);
+    if(neg) pushBot('已记下你的调整说明，我会在该口径上按你的要求处理。');
+    g.step++;
+    if(g.step<GUIDE_STEPS.length){ pushBot(GUIDE_STEPS[g.step].q); }
+    else { pushBot('全部 7 项口径已确认完成。'); offerGenerate(); }
+    return;
+  }
+  if(!state.ai.key){ pushBot('（未接入 AI）已记录。\n提示：出 9-sheet 数据分析表无需 API——直接选「数据表」点「生成9-sheet报告」即可；或点上方「开始引导问答」逐项确认口径。'); return; }
+  pushBot('（思考中…）',true);
+  try{
+    const reply=await callClaude();
+    $('#chatlog').lastChild.remove();
+    handleAssistantReply(reply);
+  }catch(e){ $('#chatlog').lastChild.remove(); pushBot('AI调用失败：'+e.message); }
+}
+
+// 助手可在回复末尾给出一段 ```action {json}``` 来驱动界面
+function handleAssistantReply(reply){
+  let display=reply, action=null;
+  const m=reply.match(/```action\s*([\s\S]*?)```/);
+  if(m){ display=reply.replace(m[0],'').trim(); try{action=JSON.parse(m[1].trim());}catch(e){} }
+  if(display) pushBot(display);
+  if(action){
+    if(action.type) switchTypeIfNeeded(action.type);
+    if(action.dimension){ setSelect('#dimSel',action.dimension); }
+    if(action.metric){ setSelect('#metricSel',action.metric); }
+    const card=document.createElement('div');
+    card.className='msg bot';
+    const desc = action.report ? '生成完整 9-sheet 报告' : `生成「${curType().name}」：维度=${action.dimension||$('#dimSel').value}，指标=${action.metric||$('#metricSel').value}`;
+    card.innerHTML=`<div class="who">系统助手</div>按你的要求 → <div class="applycard" onclick="generate()">▶ 点此执行：${escapeHtml(desc)}</div>`;
+    $('#chatlog').appendChild(card); $('#chatlog').scrollTop=$('#chatlog').scrollHeight;
+    if(action.autorun) generate();
+  }
+}
+function switchTypeIfNeeded(t){ if(CHART_TYPES.find(x=>x.key===t) && t!==state.activeType) switchType(t); }
+function setSelect(sel,val){ const el=$(sel); const o=[...el.options].find(o=>o.value===val||o.textContent===val); if(o){ el.value=o.value; } }
+
+async function callClaude(){
+  const st=state.types[state.activeType];
+  const dims=[...$('#dimSel').options].map(o=>o.value).join('、')||'(需先上传底表)';
+  const sys=`你是资深数据分析师，正帮用户做「VAN类车·西北五省(陕西/内蒙古/甘肃/宁夏/青海)·上险销量」的月度分析。`+
+    `当前图表类型：${curType().name}。底表统计期间：${state.base?.period||'未上传'}；可用维度字段：${dims}；指标：销量/同比/占有率。`+
+    `分析口径（须遵守）：销量=底表「数量」求和、0值留空；同比=本期÷去年同期-1，去年同期为0且本期有量记「净增长」；占有率=该项÷同列总销量；占同比=本期占有率-去年同期占有率。`+
+    `请像当初规划报告那样：先就不清楚的细节一次追问1-2个最关键问题；待口径清晰后，用简洁中文给结论，并在消息末尾附一段机器指令以驱动界面，格式：\n\`\`\`action\n{"type":"pie|bar|line|table","dimension":"<维度字段名>","metric":"销量|同比|占有率","report":false,"autorun":false}\n\`\`\`\n（"数据表"类型用 {"type":"table","report":true} 表示生成完整9-sheet报告。仅在确实要出图/出表时才附 action，纯追问时不要附。）`;
+  const messages=st.chat.filter(m=>m.text&&m.text!=='（思考中…）').map(m=>({role:m.role==='user'?'user':'assistant', content:m.text}));
+  const res=await fetch('https://api.anthropic.com/v1/messages',{
+    method:'POST',
+    headers:{'content-type':'application/json','x-api-key':state.ai.key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+    body:JSON.stringify({model:state.ai.model||'claude-opus-4-8',max_tokens:1200,system:sys,messages})
+  });
+  if(!res.ok) throw new Error('HTTP '+res.status+' '+(await res.text()).slice(0,200));
+  const data=await res.json();
+  return data.content.map(c=>c.text||'').join('').trim()||'(空回复)';
+}
+
+/* ================= CHART ENGINE (pie/bar/line) ================= */
+const DIM_DEFS=[
+  {key:'企业品牌',label:'企业品牌'},{key:'省份',label:'省份'},{key:'城市',label:'城市'},
+  {key:'大中VAN',label:'大中VAN'},{key:'燃料种类',label:'燃料种类'},{key:'功能分类2',label:'功能分类'},
+  {key:'米段（轴距划分）',label:'米段'},{key:'窗',label:'明盲窗'},{key:'10类专用',label:'10类专用'},
+];
+function rebuildSelectors(){
+  const dim=$('#dimSel'), met=$('#metricSel'); dim.innerHTML=''; met.innerHTML='';
+  const cols=state.base?state.base.cols:[];
+  DIM_DEFS.forEach(d=>{ if(!state.base||resolveCol(cols,d.key)){ const o=document.createElement('option'); o.value=d.key; o.textContent=d.label; dim.appendChild(o);} });
+  [['销量','本期销量'],['同比','同比%'],['占有率','占有率%']].forEach(([v,t])=>{const o=document.createElement('option');o.value=v;o.textContent=t;met.appendChild(o);});
+}
+function computeSeries(dimKey){
+  const b=state.base; if(!b) return null;
+  const dCol=resolveCol(b.cols,dimKey), qCol=resolveCol(b.cols,'数量'), yCol=resolveCol(b.cols,'年份'), mCol=resolveCol(b.cols,'月份');
+  if(!dCol||!qCol) return {error:'底表缺少必要字段（维度或「数量」）'};
+  const years=[...new Set(b.rows.map(r=>Number(r[yCol])).filter(n=>!isNaN(n)))];
+  const cy=Math.max(...years), py=cy-1;
+  const cyMonths=new Set(b.rows.filter(r=>Number(r[yCol])===cy).map(r=>Number(r[mCol])));
+  const inCur=r=>Number(r[yCol])===cy&&cyMonths.has(Number(r[mCol]));
+  const inPre=r=>Number(r[yCol])===py&&cyMonths.has(Number(r[mCol]));
+  const cur={},pre={}; let curTot=0;
+  b.rows.forEach(r=>{const k=r[dCol]; if(k==null||k==='')return; const q=Number(r[qCol])||0;
+    if(inCur(r)){cur[k]=(cur[k]||0)+q; curTot+=q;} else if(yCol&&inPre(r)){pre[k]=(pre[k]||0)+q;}});
+  const rows=Object.keys(cur).map(k=>{const c=cur[k],p=pre[k]||0; let yo=null; if(p>0)yo=c/p-1; else if(c>0)yo='净增长'; return {key:k,销量:c,同比:yo,占有率:curTot>0?c/curTot:0};})
+    .filter(r=>r.销量>0).sort((a,b)=>b.销量-a.销量);
+  return {rows,curTot,cy,cyMonths:[...cyMonths].sort((a,b)=>a-b)};
+}
+let chartObj=null;
+function metricLabel(m){return m==='销量'?'本期销量':m==='同比'?'同比%':'占有率%';}
+function drawChart(type,res,metric,dimLabel){
+  const top=res.rows.slice(0,type==='pie'?10:18), labels=top.map(r=>r.key);
+  const data=top.map(r=>metric==='销量'?r.销量:metric==='占有率'?+(r.占有率*100).toFixed(1):(r.同比==='净增长'||r.同比==null?0:+(r.同比*100).toFixed(1)));
+  const palette=['#2f6df5','#1f9d6b','#caa12a','#e8743b','#7e57c2','#26a69a','#ec407a','#5c6bc0','#8d6e63','#42a5f5','#66bb6a','#ffa726','#ab47bc','#26c6da','#d4e157','#ff7043','#789262','#9575cd'];
+  const cv=$('#cv').getContext('2d');
+  chartObj=new Chart(cv,{type:type==='pie'?'pie':type,
+    data:{labels,datasets:[{label:metricLabel(metric),data,
+      backgroundColor:type==='line'?'rgba(47,109,245,.15)':labels.map((_,i)=>palette[i%palette.length]),
+      borderColor:type==='line'?'#2f6df5':'#fff',borderWidth:type==='pie'?1:0,fill:type==='line',tension:.3,pointRadius:3}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:type==='pie',position:'right'},
+        tooltip:{callbacks:{label:c=>` ${c.label}: ${metric==='销量'?fmtNum(c.parsed.y??c.parsed):c.parsed+'%'}`}}},
+      scales:type==='pie'?{}:{y:{beginAtZero:true}}}});
+}
+function fmtNum(n){return (Math.round(n*100)/100).toLocaleString('zh-CN');}
+function fmtYoy(v){if(v==null)return '—'; if(v==='净增长')return '<span style="color:var(--green)">净增长</span>'; const p=(v*100).toFixed(1); return `<span style="color:${v>=0?'var(--green)':'#c0392b'}">${v>=0?'+':''}${p}%</span>`;}
+
+/* ================= GENERATE ================= */
+function generate(){
+  if(!state.base){ alert('请先上传数据底表'); return; }
+  if(state.activeType==='table'){ runReport(); return; }
+  const dimKey=$('#dimSel').value, metric=$('#metricSel').value;
+  const res=computeSeries(dimKey); if(!res||res.error){ alert(res?res.error:'无法计算'); return; }
+  if(chartObj){chartObj.destroy();chartObj=null;}
+  const dimLabel=(DIM_DEFS.find(d=>d.key===dimKey)||{}).label||dimKey;
+  $('#outbody').innerHTML=`<div class="row" style="margin-bottom:8px"><b>${state.base.period} · ${dimLabel} · ${metricLabel(metric)}</b></div><div class="chartwrap"><canvas id="cv"></canvas></div>`;
+  drawChart(state.activeType,res,metric,dimLabel);
+  state._lastResult={kind:'chart',res,dimLabel,metric,type:state.activeType};
+}
+
+/* ================= PYODIDE 9-SHEET REPORT ================= */
+let pyodide=null, pyReportCache=null;
+async function ensurePyodide(){
+  if(pyodide) return pyodide;
+  setReportStatus('正在加载 Python 运行环境(首次约需 15-30 秒)…',true);
+  pyodide=await loadPyodide();
+  // pandas 走内置编译包；openpyxl 是纯 Python 包，需经 micropip 从 PyPI 安装
+  setReportStatus('正在加载 pandas…',true);
+  await pyodide.loadPackage(['pandas','micropip']);
+  setReportStatus('正在安装 openpyxl…',true);
+  await pyodide.runPythonAsync(`
+import micropip
+await micropip.install('openpyxl')
+`);
+  // write the embedded modules into a virtual /work dir
+  pyodide.FS.mkdirTree('/work');
+  const put=(name,id)=>pyodide.FS.writeFile('/work/'+name, document.getElementById(id).textContent);
+  put('core.py','py_core'); put('engine.py','py_engine'); put('wr.py','py_wr');
+  return pyodide;
+}
+function setReportStatus(msg,spin){
+  $('#outbody').innerHTML=`<div class="pybar">${spin?'<span class="spin"></span>':''}<span>${escapeHtml(msg)}</span></div>`;
+}
+async function runReport(){
+  try{
+    if(pyReportCache){ renderReport(pyReportCache); return; }
+    await ensurePyodide();
+    const hasMK=!!(state.baseMK&&state.baseMK.bytes);
+    setReportStatus(hasMK?'正在按项目模板生成 10-sheet 报告（含微卡 sheet10）…':'正在按项目模板生成 9-sheet 报告…',true);
+    pyodide.FS.writeFile('/work/底表.xlsx', state.base.bytes);
+    if(hasMK) pyodide.FS.writeFile('/work/微卡底表.xlsx', state.baseMK.bytes);
+    pyodide.runPython('import os; os.chdir("/work")');
+    // 关键：清掉已缓存的模块，强制按当前底表重新读取（否则同一会话内换月/换省份后仍用上次的数据）
+    pyodide.runPython('import sys\nfor _m in ("core","engine","wr","build"): sys.modules.pop(_m, None)');
+    // 注入 Sheet3 分省/分城市口径（供 build.py 读取）
+    const s3mode=$('#s3Mode').value||'auto';
+    const s3prov=(s3mode==='city')?($('#s3Prov').value||''):'';
+    pyodide.globals.set('SHEET3_MODE', s3mode);
+    pyodide.globals.set('SHEET3_PROV', s3prov||null);
+    pyodide.globals.set('HAS_MK', hasMK);   // 有微卡底表才追加 sheet10
+    pyodide.runPython(document.getElementById('py_build').textContent);
+    const outName=pyodide.globals.get('RESULT_FILE');
+    const xlsxBytes=pyodide.FS.readFile('/work/'+outName);
+    pyReportCache={name:outName, bytes:new Uint8Array(xlsxBytes)};
+    renderReport(pyReportCache);
+  }catch(e){
+    const msg=e.message||String(e);
+    const envErr=/package|micropip|loadPyodide|network|fetch|Failed to|openpyxl|ModuleNotFound|import/i.test(msg);
+    const hint = envErr
+      ? `这是运行环境/网络问题（不是底表字段问题）。首次生成需联网从 PyPI 安装 openpyxl，请确认网络正常后重试。`
+      : `请确认底表字段与口径说明一致（含：数量/年份/月份/省份/城市/企业品牌/大中VAN/燃料种类2/米段/功能分类2/窗/容积段/10类专用/VAN种类）。`;
+    pyodide=null; // 失败后重置，下次重试会重新初始化
+    $('#outbody').innerHTML=`<div class="placeholder"><div class="big">⚠</div><div>报告生成失败</div><div class="small">${escapeHtml(msg)}</div><div class="small">${hint}</div><div class="applycard" style="margin-top:10px" onclick="genReport()">↻ 重试生成</div></div>`;
+  }
+}
+function renderReport(rep){
+  const wb=XLSX.read(rep.bytes,{type:'array'});
+  const tabs=wb.SheetNames;
+  let html=`<div class="row" style="margin-bottom:8px"><b>${escapeHtml(rep.name)}</b><span class="spacer"></span><span class="small">共 ${tabs.length} 个 sheet · 与本地脚本同口径</span></div>`;
+  html+=`<div class="sheettabs" id="sheettabs">`+tabs.map((n,i)=>`<div class="stab${i===0?' active':''}" data-i="${i}">${escapeHtml(n)}</div>`).join('')+`</div>`;
+  html+=`<div class="reportbox" id="reportbox"></div>`;
+  $('#outbody').innerHTML=html;
+  const show=i=>{
+    const ws=wb.Sheets[tabs[i]];
+    $('#reportbox').innerHTML=XLSX.utils.sheet_to_html(ws,{editable:false});
+    const tbl=$('#reportbox table'); if(tbl){ tbl.className='res'; tbl.querySelectorAll('td').forEach(td=>{ if(/^-?\d+\.\d$/.test((td.textContent||'').trim())) {} }); }
+    document.querySelectorAll('#sheettabs .stab').forEach(s=>s.classList.toggle('active',+s.dataset.i===i));
+  };
+  document.querySelectorAll('#sheettabs .stab').forEach(s=>s.onclick=()=>show(+s.dataset.i));
+  show(0);
+  state._lastResult={kind:'report'};
+}
+
+/* ================= EXPORT ================= */
+function exportResult(){
+  const r=state._lastResult;
+  if(state.activeType==='table'){
+    if(!pyReportCache){ alert('请先生成 9-sheet 报告'); return; }
+    const blob=new Blob([pyReportCache.bytes],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=pyReportCache.name; a.click(); URL.revokeObjectURL(a.href);
+    return;
+  }
+  if(!r||r.kind!=='chart'){ alert('请先生成分析'); return; }
+  const cv=document.getElementById('cv'); if(!cv){alert('无图表');return;}
+  const a=document.createElement('a'); a.href=cv.toDataURL('image/png'); a.download=`${state.base.period}_${r.dimLabel}_${curType().name}.png`; a.click();
+}
+
+/* ================= DROP / RESIZE WIRING ================= */
+function wireDrop(dropId,inputId,handler){
+  const d=$(dropId),i=$(inputId);
+  d.onclick=()=>i.click();
+  i.onchange=()=>{ if(i.files[0]){handler(i.files[0]); i.value='';} };
+  ['dragover','dragenter'].forEach(ev=>d.addEventListener(ev,e=>{e.preventDefault();d.classList.add('drag');}));
+  ['dragleave','drop'].forEach(ev=>d.addEventListener(ev,e=>{e.preventDefault();d.classList.remove('drag');}));
+  d.addEventListener('drop',e=>{ if(e.dataTransfer.files[0]) handler(e.dataTransfer.files[0]); });
+}
+const RZ_LS='van_rz_v1';
+function initResizers(){
+  const root=document.documentElement.style;
+  try{const s=JSON.parse(localStorage.getItem(RZ_LS)||'{}');
+    if(s.leftWidth)root.setProperty('--left-w',s.leftWidth+'px');
+    if(s.lefttop)root.setProperty('--lefttop-h',s.lefttop+'px');
+    if(s.typeH)$('#typeCard').style.height=s.typeH+'px';}catch(e){}
+  function setSaved(k,v){const cur=JSON.parse(localStorage.getItem(RZ_LS)||'{}');cur[k]=v;localStorage.setItem(RZ_LS,JSON.stringify(cur));}
+  document.querySelectorAll('.rz').forEach(rz=>{const kind=rz.dataset.rz;
+    rz.addEventListener('mousedown',e=>{e.preventDefault();rz.classList.add('active');document.body.classList.add('dragging');
+      document.body.style.cursor=rz.classList.contains('rz-v')?'col-resize':'row-resize';
+      const sX=e.clientX,sY=e.clientY; let sv;
+      if(kind==='leftWidth')sv=$('.left').getBoundingClientRect().width;
+      if(kind==='leftV')sv=$('#leftTop').getBoundingClientRect().height;
+      if(kind==='rightV')sv=$('#typeCard').getBoundingClientRect().height;
+      function move(ev){
+        if(kind==='leftWidth'){let w=Math.max(220,Math.min(640,sv+(ev.clientX-sX)));root.setProperty('--left-w',w+'px');setSaved('leftWidth',Math.round(w));}
+        else if(kind==='leftV'){let h=Math.max(70,Math.min(window.innerHeight-220,sv+(ev.clientY-sY)));root.setProperty('--lefttop-h',h+'px');setSaved('lefttop',Math.round(h));}
+        else if(kind==='rightV'){let h=Math.max(60,Math.min(window.innerHeight-260,sv+(ev.clientY-sY)));$('#typeCard').style.height=h+'px';setSaved('typeH',Math.round(h));}
+        if(chartObj)chartObj.resize();
+      }
+      function up(){rz.classList.remove('active');document.body.classList.remove('dragging');document.body.style.cursor='';window.removeEventListener('mousemove',move);window.removeEventListener('mouseup',up);if(chartObj)chartObj.resize();}
+      window.addEventListener('mousemove',move);window.addEventListener('mouseup',up);});
+  });
+}
+
+function init(){
+  load();
+  renderTabs(); renderBase(); renderBaseMK(); renderTypePanels(); rebuildSelectors();
+  wireDrop('#baseDrop','#baseFile',handleBase);
+  wireDrop('#baseMKDrop','#baseMKFile',handleBaseMK);
+  wireDrop('#tplDrop','#tplFile',handleTpl);
+  document.querySelectorAll('.hd[data-collapse]').forEach(h=>{h.style.cursor='pointer';h.onclick=()=>$('#'+h.dataset.collapse).classList.toggle('collapsed');});
+  initResizers();
+  $('#sendBtn').onclick=sendChat;
+  $('#chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}});
+  $('#genBtn').onclick=generate;
+  $('#exportBtn').onclick=exportResult;
+  // Sheet3 分省/分城市 切换：清缓存并重新出表
+  $('#s3Mode').onchange=()=>{ pyReportCache=null; syncS3Controls();
+    if(state.activeType==='table' && state.base){ runReport(); } };
+  $('#s3Prov').onchange=()=>{ pyReportCache=null;
+    if(state.activeType==='table' && state.base){ runReport(); } };
+  $('#aiBtn').onclick=()=>{$('#apiKey').value=state.ai.key;$('#apiModel').value=state.ai.model;$('#aiModal').classList.add('show');};
+  $('#aiCancel').onclick=()=>$('#aiModal').classList.remove('show');
+  $('#aiSave').onclick=()=>{state.ai.key=$('#apiKey').value.trim();state.ai.model=$('#apiModel').value.trim()||'claude-opus-4-8';save();$('#aiModal').classList.remove('show');pushSys(state.ai.key?'AI助手已启用：交流窗口进入自由对话模式，可直接驱动出图。':'未填Key：交流窗口仅作记录。');};
+  $('#resetBtn').onclick=()=>{if(confirm('清空全部数据、模板与对话？')){localStorage.removeItem(LS);location.reload();}};
+}
+init();
+</script>
+</body>
+</html>
