@@ -11,6 +11,46 @@ warnings.filterwarnings('ignore')
 
 RAW='底表.xlsx'
 FULL = pd.read_excel(RAW, sheet_name=0)
+
+# ---- 列名规范化：底表列名存在别名/空格差异时，统一重命名为标准列名 ----
+# 与前端 COL_ALIASES 一致，避免出现 KeyError: '年份' 这类列名不匹配问题
+_COL_ALIASES = {
+    '数量':['数量','销量','上险数','上险量','台数','量'],
+    '年份':['年份','年'],
+    '月份':['月份','月'],
+    '省份':['省份','省'],
+    '城市':['城市','市','使用城市'],
+    '企业品牌':['企业品牌','品牌','厂家','企业'],
+    '大中VAN':['大中VAN','大中van','车型分类'],
+    '燃料种类':['燃料种类','燃料'],
+    '燃料种类2':['燃料种类2','能源类型'],
+    '功能分类2':['功能分类2','功能分类','功能'],
+    '米段（轴距划分）':['米段（轴距划分）','米段','轴距'],
+    '窗':['窗','明盲窗'],
+    '10类专用':['10类专用','专用'],
+    'VAN种类':['VAN种类','van种类'],
+    '容积段（新）':['容积段（新）','容积段','容积'],
+}
+def _normalize_cols(df):
+    cols=list(df.columns); used=set(); ren={}
+    for canon,als in _COL_ALIASES.items():
+        if canon in cols: used.add(canon); continue      # 已是标准名，不动
+        found=None
+        for a in als:                                     # 先精确（忽略首尾空格）匹配
+            for c in cols:
+                if c in used: continue
+                if str(c).strip()==a: found=c; break
+            if found: break
+        if not found:                                     # 再退回包含匹配
+            for a in als:
+                for c in cols:
+                    if c in used: continue
+                    if a in str(c): found=c; break
+                if found: break
+        if found: ren[found]=canon; used.add(found)
+    return df.rename(columns=ren)
+FULL = _normalize_cols(FULL)
+
 # 动态识别统计期间：最新年份为本期，其覆盖的连续月份为统计区间，上一年为同期
 MAXY = int(pd.to_numeric(FULL['年份'], errors='coerce').max())
 MINY = MAXY - 1
@@ -1653,8 +1693,11 @@ async function runReport(){
     renderReport(pyReportCache);
   }catch(e){
     const msg=e.message||String(e);
-    const envErr=/package|micropip|loadPyodide|network|fetch|Failed to|openpyxl|ModuleNotFound|import/i.test(msg);
-    const hint = envErr
+    const fieldErr=/KeyError|columns|not in index|label/i.test(msg);
+    const envErr=!fieldErr && /package|micropip|loadPyodide|network|fetch|Failed to|openpyxl|ModuleNotFound/i.test(msg);
+    const hint = fieldErr
+      ? `这是底表列名不匹配问题：脚本已内置列名别名容错（年份/年、数量/销量 等），若仍报某列缺失，请检查底表是否含该字段、表头是否在首行、有无多余标题行。`
+      : envErr
       ? `这是运行环境/网络问题（不是底表字段问题）。首次生成需联网从 PyPI 安装 openpyxl，请确认网络正常后重试。`
       : `请确认底表字段与口径说明一致（含：数量/年份/月份/省份/城市/企业品牌/大中VAN/燃料种类2/米段/功能分类2/窗/容积段/10类专用/VAN种类）。`;
     pyodide=null; // 失败后重置，下次重试会重新初始化
