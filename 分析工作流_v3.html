@@ -51,6 +51,14 @@ def _normalize_cols(df):
     return df.rename(columns=ren)
 FULL = _normalize_cols(FULL)
 
+# 将高频筛选用的字符串列转为 category dtype：
+# object dtype 的 == 比较是逐元素 Python 级操作，40K+ 行时是主要性能瓶颈；
+# category dtype 的比较在底层用整数编码做向量化比较，速度提升一个数量级。
+for _c in FULL.columns:
+    if FULL[_c].dtype == object:
+        FULL[_c] = FULL[_c].astype('category')
+
+
 # 动态识别统计期间：最新年份为本期，其覆盖的连续月份为统计区间，上一年为同期
 MAXY = int(pd.to_numeric(FULL['年份'], errors='coerce').max())
 MINY = MAXY - 1
@@ -85,27 +93,67 @@ def cities_of(prov):
     return _rank_by_sales(CUR,'城市',{'省份':prov}) or _rank_by_sales(FULL,'城市',{'省份':prov})
 
 _SSUM_CACHE={}
-def _clear_ssum_cache(): _SSUM_CACHE.clear()
+def _clear_ssum_cache():
+    _SSUM_CACHE.clear(); _COL_CACHE.clear(); _QTY_CACHE.clear(); _FRAME_KEEPALIVE.clear()
+
+import numpy as np
+_COL_CACHE={}   # (id(frame), col) -> (codes ndarray, {category: code})  或 (values ndarray, None) 非categorical
+_QTY_CACHE={}   # id(frame) -> 数量 ndarray
+_FRAME_KEEPALIVE={}  # id(frame) -> frame，防止frame被GC后id被复用导致缓存串号
+
+def _col_codes(frame, k):
+    _FRAME_KEEPALIVE[id(frame)]=frame
+    key=(id(frame), k)
+    hit=_COL_CACHE.get(key)
+    if hit is not None: return hit
+    col=frame[k]
+    if hasattr(col,'cat'):
+        codes=col.cat.codes.values
+        lut={cat:i for i,cat in enumerate(col.cat.categories)}
+        res=(codes, lut)
+    else:
+        res=(col.values, None)
+    _COL_CACHE[key]=res
+    return res
+
+def _qty_arr(frame):
+    _FRAME_KEEPALIVE[id(frame)]=frame
+    key=id(frame)
+    hit=_QTY_CACHE.get(key)
+    if hit is not None: return hit
+    arr=frame['数量'].values.astype(float)
+    _QTY_CACHE[key]=arr
+    return arr
+
+def _build_mask(frame, f):
+    m=np.ones(len(frame), dtype=bool)
+    for k,v in f.items():
+        vals,lut=_col_codes(frame,k)
+        if lut is not None:
+            if isinstance(v,(list,tuple,set)):
+                vcodes=[lut.get(x,-1) for x in v]
+                m &= np.isin(vals, vcodes)
+            else:
+                m &= (vals==lut.get(v,-1))
+        else:
+            if isinstance(v,(list,tuple,set)): m &= np.isin(vals, list(v))
+            else: m &= (vals==v)
+    return m
+
 def ssum(frame, f):
-    if not f: return float(frame['数量'].sum())
+    if not f: return float(_qty_arr(frame).sum())
     items=tuple(sorted((k,(tuple(v) if isinstance(v,(list,tuple,set)) else v)) for k,v in f.items()))
     key=(id(frame), items)
     hit=_SSUM_CACHE.get(key)
     if hit is not None: return hit
-    m = pd.Series(True, index=frame.index)
-    for k,v in f.items():
-        if isinstance(v,(list,tuple,set)): m &= frame[k].isin(v)
-        else: m &= (frame[k]==v)
-    res = float(frame.loc[m,'数量'].sum())
+    m=_build_mask(frame,f)
+    res=float(_qty_arr(frame)[m].sum())
     _SSUM_CACHE[key]=res
     return res
 
 def sub(frame, f):
     if not f: return frame
-    m = pd.Series(True, index=frame.index)
-    for k,v in f.items():
-        if isinstance(v,(list,tuple,set)): m &= frame[k].isin(v)
-        else: m &= (frame[k]==v)
+    m=_build_mask(frame,f)
     return frame.loc[m]
 
 def fmt_pct(x):
@@ -272,9 +320,11 @@ def set_widths(ws, first_w, rest_w, ncol, first_cols=1):
 <script type="text/python" id="py_build">
 import warnings
 warnings.filterwarnings('ignore')
+import asyncio
 import sys; sys.path.insert(0,'/work')
 import engine, core
 from core import *
+from core import _rank_by_sales
 from wr import *
 from engine import *
 from openpyxl import Workbook
@@ -555,6 +605,92 @@ def sheet5(ws):
     set_widths(ws,9,8.0,ncol,first_cols=3+off); ws.freeze_panes=_shift('D5',off)
     set_region({}); engine.BASE={}
 
+def sheet5_1(ws):
+    off=1
+    scenes=[('改装定制',C('K')),('客货两用',C('O')),('商旅客运',C('S')),('专业物流',C('W'))]
+
+    def top80_by(frame, base, brand, col='产品线'):
+        cand = _rank_by_sales(frame, col, within=merged(base, {'企业品牌': brand}))
+        if not cand: return []
+        tot = ssum(frame, merged(base, {'企业品牌': brand}))
+        if not tot: return []
+        cum = 0.0; out = []
+        for x in cand:
+            v = ssum(frame, merged(base, {'企业品牌': brand, col: x}))
+            out.append(x); cum += v
+            if cum / tot >= 0.8: break
+        return out
+
+    # 预计算所有品牌的top80产品线（使用CUR0全量帧，一次计算，多次复用）
+    all_brands = brands_by_sales(CUR0, base=DV)
+    brand_plines = {b: top80_by(CUR0, DV, b, '产品线') for b in all_brands}
+
+    def specfor(denom_rgf):
+        cs=[
+            (C('E'),'销量',{},{'curF':Y25}),(C('F'),'占有率',{},{'curF':Y25,'denom':denom_rgf}),
+            (C('G'),'销量',{}),(C('H'),'同比',{}),(C('I'),'占有率',{},{'denom':denom_rgf}),(C('J'),'占同比',{},{'denom':denom_rgf}),
+        ]
+        for scn,cb in scenes:
+            ff={'功能分类2':scn}
+            cs += [(cb,'销量',ff),(cb+1,'同比',ff),(cb+2,'占有率',ff,{'denom':denom_rgf}),(cb+3,'占同比',ff,{'denom':denom_rgf})]
+        return shift_spec(cs, off)
+    ncol=C('Z')+off; ps=pct_set(specfor({})); set_ztb(ztb_set(specfor({})))
+    setcell(ws,'A1','区域范围',merge='A1:A4')
+    setc(ws,'A1',f'{P}大VAN销量（按产品线展开）',off,merge='A1:Z1')
+    setc(ws,'A2','分燃料',off,merge='A2:A4'); setc(ws,'B2','米段',off,merge='B2:B4'); setc(ws,'C2','企业品牌',off,merge='C2:C4'); setc(ws,'D2','产品线',off,merge='D2:D4')
+    setc(ws,'E2',PY,off,merge='E2:F3'); setc(ws,'G2',f'{P}汇总',off,merge='G2:J3'); setc(ws,'K2','分场景',off,merge='K2:Z2')
+    setc(ws,'K3','改装定制',off,merge='K3:N3'); setc(ws,'O3','客货两用',off,merge='O3:R3'); setc(ws,'S3','商旅客运',off,merge='S3:V3'); setc(ws,'W3','专业物流',off,merge='W3:Z3')
+    h4=['销量','占有率','销量','同比','占有率','占同比']+['销量','同比','占有率','占同比']*4
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(5+off+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+
+    def block(rgf0,label,total_label,r):
+        set_region(rgf0); engine.BASE=DV; data_rs=r
+        for fuel,ff in [('传统燃料',TR),('新能源',NE)]:
+            fuel_rs=r
+            msegs=[m for m in ['5.0米','5.5米','6.0米'] if ssum(CUR,{**ff,MSEG:m})>0]
+            for mseg in msegs:
+                grp={**ff,MSEG:mseg}; m_rs=r
+                bs=brands_by_sales(CUR,grp,base=DV)
+                for b in bs:
+                    plines = brand_plines.get(b, [])
+                    plines_here = [p for p in plines if ssum(CUR, merged(grp, {'企业品牌':b, '产品线':p}))>0]
+                    if not plines_here: continue
+                    brand_rs = r
+                    for p in plines_here:
+                        pf = {**grp, '产品线':p}
+                        write_row(ws,r,[(4+off,p)],build_values(specfor(grp),pf,b),ps,ncol); r+=1
+                    if len(plines_here) >= 2:
+                        write_row(ws,r,[(3+off,f'{b} 汇总')],build_values(specfor(grp),grp,b),ps,ncol,fill=SUBT,bold=True)
+                        ws.merge_cells(start_row=r,start_column=3+off,end_row=r,end_column=4+off)
+                        ws.merge_cells(start_row=brand_rs,start_column=3+off,end_row=r-1,end_column=3+off)
+                        r+=1
+                    else:
+                        ws.merge_cells(start_row=brand_rs,start_column=3+off,end_row=r-1,end_column=3+off)
+                    ws.cell(row=brand_rs,column=3+off,value=b).alignment=CEN
+                write_row(ws,r,[(2+off,f'{mseg} 汇总')],build_values(specfor(grp),grp,None),ps,ncol,fill=SUBT,bold=True)
+                ws.merge_cells(start_row=r,start_column=2+off,end_row=r,end_column=4+off)
+                if r>m_rs:
+                    ws.merge_cells(start_row=m_rs,start_column=2+off,end_row=r-1,end_column=2+off)
+                    ws.cell(row=m_rs,column=2+off,value=mseg).alignment=CEN
+                r+=1
+            write_row(ws,r,[(1+off,f'{fuel} 汇总')],build_values(specfor(ff),ff,None),ps,ncol,fill=TOT,bold=True)
+            ws.merge_cells(start_row=r,start_column=1+off,end_row=r,end_column=4+off)
+            ws.merge_cells(start_row=fuel_rs,start_column=1+off,end_row=r-1,end_column=1+off)
+            ws.cell(row=fuel_rs,column=1+off,value=fuel).alignment=CEN
+            r+=1
+        if r>data_rs:
+            ws.merge_cells(start_row=data_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=data_rs,column=1,value=label).alignment=CEN
+        write_row(ws,r,[(1,total_label)],build_values(specfor({}),{},None),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=4+off)
+        return r+1
+    r=5
+    for label,total_label,rgf0 in REGIONS:
+        r=block(rgf0,label,total_label,r)
+    set_widths(ws,9,8.0,ncol,first_cols=4+off); ws.freeze_panes=_shift('E5',off)
+    set_region({}); engine.BASE={}
+
 def sheet6(ws):
     off=1
 
@@ -707,6 +843,102 @@ def sheet7(ws):
     for label,_total,rgf0 in REGIONS:
         r=block(rgf0,label,r)
     set_widths(ws,9,8.0,ncol,first_cols=2+off); ws.freeze_panes=_shift('C5',off)
+    set_region({}); engine.BASE={}
+
+def sheet7_1(ws):
+    off=1
+    scope = merged(ZV, NE)
+    V6={VOL:'6m³'}; V7={VOL:'7m³'}; V8={VOL:'8m³'}
+
+    def top80_by(frame, base, brand, col='产品线'):
+        cand = _rank_by_sales(frame, col, within=merged(base, {'企业品牌': brand}))
+        if not cand: return []
+        tot = ssum(frame, merged(base, {'企业品牌': brand}))
+        if not tot: return []
+        cum = 0.0; out = []
+        for x in cand:
+            v = ssum(frame, merged(base, {'企业品牌': brand, col: x}))
+            out.append(x); cum += v
+            if cum / tot >= 0.8: break
+        return out
+
+    # 预计算所有品牌的top80产品线（使用CUR0全量帧，一次计算，多次复用）
+    all_brands = brands_by_sales(CUR0, base=scope)
+    brand_plines = {b: top80_by(CUR0, scope, b, '产品线') for b in all_brands}
+
+    def specfor():
+        cs = [
+            (C('E'),'销量',{}),(C('F'),'同比',{}),(C('G'),'占有率',{}),(C('H'),'占同比',{}),
+            (C('I'),'销量',{'窗':'明窗'}),(C('J'),'同比',{'窗':'明窗'}),(C('K'),'占有率',{'窗':'明窗'}),(C('L'),'占同比',{'窗':'明窗'}),
+            (C('M'),'销量',{'窗':'盲窗'}),(C('N'),'同比',{'窗':'盲窗'}),(C('O'),'占有率',{'窗':'盲窗'}),(C('P'),'占同比',{'窗':'盲窗'}),
+            (C('Q'),'销量',V6),(C('R'),'同比',V6),(C('S'),'占有率',V6),(C('T'),'占同比',V6),
+            (C('U'),'销量',V7),(C('V'),'同比',V7),(C('W'),'占有率',V7),(C('X'),'占同比',V7),
+            (C('Y'),'销量',V8),(C('Z'),'同比',V8),(C('AA'),'占有率',V8),(C('AB'),'占同比',V8),
+        ]
+        return shift_spec(cs, off)
+    ncol=C('AB')+off; ps=pct_set(specfor()); set_ztb(ztb_set(specfor()))
+
+    setcell(ws,'A1','区域范围',merge='A1:A4')
+    setc(ws,'A1',f'{P}中VAN新能源市场情况',off,merge='A1:AB1')
+    setc(ws,'A2','企业品牌',off,merge='A2:A4'); setc(ws,'B2','产品线',off,merge='B2:B4'); setc(ws,'C2','电池厂家修正',off,merge='C2:C4'); setc(ws,'D2','电量段',off,merge='D2:D4')
+    setc(ws,'E2','新能源汇总',off,merge='E2:H3'); setc(ws,'I2','明窗汇总',off,merge='I2:L3'); setc(ws,'M2','盲窗汇总',off,merge='M2:P3')
+    setc(ws,'Q2','新能源',off,merge='Q2:AB2')
+    setc(ws,'Q3','6m³',off,merge='Q3:T3'); setc(ws,'U3','7m³',off,merge='U3:X3'); setc(ws,'Y3','8m³',off,merge='Y3:AB3')
+    h4=['销量','同比','占有率','占同比']*6
+    for i,v in enumerate(h4): setcell(ws,f'{get_column_letter(5+off+i)}4',v,fill=HDR2)
+    style_header_block(ws,1,4,1,ncol)
+
+    def block(rgf0,label,total_label,r):
+        set_region(rgf0); engine.BASE=scope; data_rs=r
+        brands = brands_by_sales(CUR, base=scope)
+        for b in brands:
+            plines_all = brand_plines.get(b, [])
+            plines = [p for p in plines_all if ssum(CUR, merged(scope, {'企业品牌':b,'产品线':p}))>0]
+            if not plines: continue
+            b_rs = r
+            for p in plines:
+                bats = _rank_by_sales(CUR, '电池厂家修正', within=merged(scope,{'企业品牌':b,'产品线':p}))
+                pl_rs = r
+                for bat in bats:
+                    caps = _rank_by_sales(CUR, '电量段', within=merged(scope,{'企业品牌':b,'产品线':p,'电池厂家修正':bat}))
+                    bat_rs = r
+                    for cap in caps:
+                        rgf = {'产品线':p,'电池厂家修正':bat,'电量段':cap}
+                        write_row(ws,r,[(4+off,cap)],build_values(specfor(),rgf,b,denom_rgf={}),ps,ncol); r+=1
+                    if len(caps) >= 2:
+                        write_row(ws,r,[(3+off,f'{bat} 汇总')],build_values(specfor(),{'产品线':p,'电池厂家修正':bat},b,denom_rgf={}),ps,ncol,fill=SUBT,bold=True)
+                        ws.merge_cells(start_row=r,start_column=3+off,end_row=r,end_column=4+off)
+                        ws.merge_cells(start_row=bat_rs,start_column=3+off,end_row=r-1,end_column=3+off)
+                        r+=1
+                    else:
+                        ws.merge_cells(start_row=bat_rs,start_column=3+off,end_row=r-1,end_column=3+off)
+                    ws.cell(row=bat_rs,column=3+off,value=bat).alignment=CEN
+                if len(bats) >= 2:
+                    write_row(ws,r,[(2+off,f'{p} 汇总')],build_values(specfor(),{'产品线':p},b,denom_rgf={}),ps,ncol,fill=SUBT,bold=True)
+                    ws.merge_cells(start_row=r,start_column=2+off,end_row=r,end_column=4+off)
+                    ws.merge_cells(start_row=pl_rs,start_column=2+off,end_row=r-1,end_column=2+off)
+                    r+=1
+                else:
+                    ws.merge_cells(start_row=pl_rs,start_column=2+off,end_row=r-1,end_column=2+off)
+                ws.cell(row=pl_rs,column=2+off,value=p).alignment=CEN
+            if len(plines) >= 2:
+                write_row(ws,r,[(1+off,f'{b} 汇总')],build_values(specfor(),{},b,denom_rgf={}),ps,ncol,fill=TOT,bold=True)
+                ws.merge_cells(start_row=r,start_column=1+off,end_row=r,end_column=4+off)
+                ws.merge_cells(start_row=b_rs,start_column=1+off,end_row=r-1,end_column=1+off)
+                r+=1
+            else:
+                ws.merge_cells(start_row=b_rs,start_column=1+off,end_row=r-1,end_column=1+off)
+            ws.cell(row=b_rs,column=1+off,value=b).alignment=CEN
+        if r>data_rs:
+            ws.merge_cells(start_row=data_rs,start_column=1,end_row=r-1,end_column=1)
+        ws.cell(row=data_rs,column=1,value=label).alignment=CEN
+        write_row(ws,r,[(1,total_label)],build_values(specfor(),{},None,denom_rgf={}),ps,ncol,fill=TOT,bold=True)
+        ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=4+off)
+        return r+1
+    r=5
+    for label,total_label,rgf0 in REGIONS:
+        r=block(rgf0,label,total_label,r)
+    set_widths(ws,9,8.0,ncol,first_cols=4+off); ws.freeze_panes=_shift('E5',off)
     set_region({}); engine.BASE={}
 
 def sheet8(ws):
@@ -918,15 +1150,95 @@ def sheet10(ws):
     set_widths(ws,9,8.0,ncol,first_cols=3); ws.freeze_panes='D5'
     use_dataset(CUR_VAN, PRE_VAN, Y25_VAN)  # 还原 VAN 数据集
 
+def sheet13(ws):
+    # 福田品牌月度市场份额趋势：三个独立市场（整体/大VAN/中VAN）各一个数据块
+    # 列布局：A=行标签, B..M=2025年1-12月(12列), N=2025年汇总, O..=2026年1-MAXM月, 末列=2026年汇总
+    scopes = [('整体', {}), ('大VAN', DV), ('中VAN', ZV)]
+    LAST_COL = 15 + MAXM
+    last_letter = get_column_letter(LAST_COL)
+
+    def dcell(coord, val, pct=False):
+        c = ws[coord]
+        if val is None:
+            c.value = None
+        elif pct:
+            c.value = val/100.0
+            c.number_format = '0.0%'
+        else:
+            c.value = val
+        c.alignment = CEN; c.border = BORDER
+
+    r = 1
+    for scope_name, scope_filter in scopes:
+        title_r, yr_r, mon_r = r, r+1, r+2
+        setcell(ws, f'A{title_r}', f'福田{scope_name}占有率变化情况', merge=f'A{title_r}:{last_letter}{title_r}')
+        setcell(ws, f'B{yr_r}', MINY, merge=f'B{yr_r}:M{yr_r}')
+        setcell(ws, f'N{yr_r}', f'{MINY}汇总', merge=f'N{yr_r}:N{mon_r}')
+        last_mon_col = get_column_letter(14+MAXM)
+        setcell(ws, f'O{yr_r}', MAXY, merge=f'O{yr_r}:{last_mon_col}{yr_r}')
+        setcell(ws, f'{last_letter}{yr_r}', f'{MAXY}汇总', merge=f'{last_letter}{yr_r}:{last_letter}{mon_r}')
+        setcell(ws, f'A{yr_r}', '', merge=f'A{yr_r}:A{mon_r}')
+        for m in range(1, 13):
+            setcell(ws, f'{get_column_letter(1+m)}{mon_r}', f'{m}月')
+        for m in range(1, MAXM+1):
+            setcell(ws, f'{get_column_letter(14+m)}{mon_r}', f'{m}月')
+
+        row_sales, row_total, row_share = mon_r+1, mon_r+2, mon_r+3
+        for lbl_r, lbl in [(row_sales,'福田销量'),(row_total,'总计销量'),(row_share,'占有率')]:
+            c = ws[f'A{lbl_r}']; c.value = lbl; c.alignment = CEN; c.border = BORDER; c.font = BOLD
+
+        foton_2025=[]; total_2025=[]; foton_2026=[]; total_2026=[]
+        for m in range(1,13):
+            fv = ssum(FULL, merged(scope_filter, {'企业品牌':'福田','年份':MINY,'月份':m}))
+            tv = ssum(FULL, merged(scope_filter, {'年份':MINY,'月份':m}))
+            foton_2025.append(fv); total_2025.append(tv)
+            col = get_column_letter(1+m)
+            dcell(f'{col}{row_sales}', fv if fv>0 else None)
+            dcell(f'{col}{row_total}', tv if tv>0 else None)
+            sh = share(fv, tv)
+            dcell(f'{col}{row_share}', fmt_pct(sh) if (sh is not None and fv>0) else None, pct=True)
+        for m in range(1,MAXM+1):
+            fv = ssum(FULL, merged(scope_filter, {'企业品牌':'福田','年份':MAXY,'月份':m}))
+            tv = ssum(FULL, merged(scope_filter, {'年份':MAXY,'月份':m}))
+            foton_2026.append(fv); total_2026.append(tv)
+            col = get_column_letter(14+m)
+            dcell(f'{col}{row_sales}', fv if fv>0 else None)
+            dcell(f'{col}{row_total}', tv if tv>0 else None)
+            sh = share(fv, tv)
+            dcell(f'{col}{row_share}', fmt_pct(sh) if (sh is not None and fv>0) else None, pct=True)
+
+        foton_2025_sum = ssum(Y25, merged(scope_filter, {'企业品牌':'福田'}))
+        total_2025_sum = ssum(Y25, scope_filter)
+        foton_2026_sum = ssum(CUR, merged(scope_filter, {'企业品牌':'福田'}))
+        total_2026_sum = ssum(CUR, scope_filter)
+        dcell(f'N{row_sales}', foton_2025_sum if foton_2025_sum>0 else None)
+        dcell(f'N{row_total}', total_2025_sum if total_2025_sum>0 else None)
+        sh25 = share(foton_2025_sum, total_2025_sum)
+        dcell(f'N{row_share}', fmt_pct(sh25) if (sh25 is not None and foton_2025_sum>0) else None, pct=True)
+        dcell(f'{last_letter}{row_sales}', foton_2026_sum if foton_2026_sum>0 else None)
+        dcell(f'{last_letter}{row_total}', total_2026_sum if total_2026_sum>0 else None)
+        sh26 = share(foton_2026_sum, total_2026_sum)
+        dcell(f'{last_letter}{row_share}', fmt_pct(sh26) if (sh26 is not None and foton_2026_sum>0) else None, pct=True)
+
+        style_header_block(ws, title_r, mon_r, 1, LAST_COL)
+        r = row_share + 1
+        if scope_name != '中VAN':
+            r += 2
+    set_widths(ws, 12, 9.0, LAST_COL, first_cols=1)
+    ws.freeze_panes = 'B4'
+
 s1=wb.active; s1.title='sheet1'; sheet1(s1)
 sheet2(wb.create_sheet('sheet2'))
 sheet3(wb.create_sheet('sheet3'))
 sheet4(wb.create_sheet('sheet4'))
 sheet5(wb.create_sheet('sheet5'))
+sheet5_1(wb.create_sheet('sheet5_1'))
 sheet6(wb.create_sheet('sheet6'))
 sheet7(wb.create_sheet('sheet7'))
+sheet7_1(wb.create_sheet('sheet7_1'))
 sheet8(wb.create_sheet('sheet8'))
 sheet9(wb.create_sheet('sheet9'))
+sheet13(wb.create_sheet('sheet13'))
 if globals().get('HAS_MK'):
     sheet10(wb.create_sheet('sheet10'))
 OUTNAME=f'{MAXY}年1-{MAXM}月分析结果.xlsx'
@@ -1231,7 +1543,7 @@ RESULT_FILE=OUTNAME
         <div class="outbody" id="outbody">
           <div class="placeholder">
             <div class="big">📈</div>
-            <div>上传数据底表后：「数据表」一键生成完整 9-sheet 报告；饼/柱/折线选维度即时出图</div>
+            <div>上传数据底表后：「数据表」一键生成完整 13-sheet 报告；饼/柱/折线选维度即时出图</div>
             <div class="small">结果可在此预览，并直接导出（报告→Excel，图表→PNG）</div>
           </div>
         </div>
@@ -1260,7 +1572,7 @@ RESULT_FILE=OUTNAME
    月度分析工作流 — 单文件应用 (v2)
    - 底表全局共用；模板+对话按图表类型隔离
    - 「数据表」类型 = 在浏览器内用 Pyodide 运行项目原版 build.py，
-     生成与本地完全一致的 9-sheet 报告（口径零漂移），并随月份自动扩展
+     生成与本地完全一致的 13-sheet 报告（口径零漂移），并随月份自动扩展
    - 饼/柱/折线 = JS 引擎按所选维度即时出图
    - 交流窗口接入 Claude，可真实对话并驱动维度/指标/筛选
    ================================================================= */
@@ -1268,7 +1580,7 @@ const $ = s => document.querySelector(s);
 const LS = 'van_workflow_v2';
 
 const CHART_TYPES = [
-  {key:'table', name:'数据表(9-sheet报告)', icon:'▦'},
+  {key:'table', name:'数据表(13-sheet报告)', icon:'▦'},
   {key:'pie',   name:'饼状图', icon:'◔'},
   {key:'bar',   name:'柱状图', icon:'▥'},
   {key:'line',  name:'折线图', icon:'∿'},
@@ -1359,7 +1671,7 @@ function handleBase(file){
       state._baseHint=null; pyReportCache=null;
       renderBase(); rebuildSelectors(); save();
       $('#baseCard').classList.add('collapsed');
-      pushSys(`已读取底表「${file.name}」，共 ${rows.length} 行，识别统计期间：${period||'未识别'}。\n· 「数据表」类型 → 一键生成完整 9-sheet 报告（口径与本地脚本一致，随月份自动扩展）\n· 饼/柱/折线 → 选维度即时出图。`);
+      pushSys(`已读取底表「${file.name}」，共 ${rows.length} 行，识别统计期间：${period||'未识别'}。\n· 「数据表」类型 → 一键生成完整 13-sheet 报告（口径与本地脚本一致，随月份自动扩展）\n· 饼/柱/折线 → 选维度即时出图。`);
     }catch(err){ alert('解析失败：'+err.message); }
   };
   reader.readAsArrayBuffer(file);
@@ -1444,7 +1756,7 @@ function renderTypePanels(){
   // sheet3 mode controls: only for 数据表(报告) type
   $('#s3Lbl').style.display=isTable?'':'none'; $('#s3Mode').style.display=isTable?'':'none';
   syncS3Controls();
-  $('#genBtn').textContent=isTable?((state.baseMK?'生成10-sheet报告':'生成9-sheet报告')):'生成分析';
+  $('#genBtn').textContent=isTable?((state.baseMK?'生成14-sheet报告':'生成13-sheet报告')):'生成分析';
 }
 // sheet3 分省/分城市 控件：填充省份下拉、按模式显隐
 function syncS3Controls(){
@@ -1476,7 +1788,7 @@ const GUIDE_STEPS = [
   {q:'第4步 · 占有率 / 占同比：占有率 = 该项 ÷ 同列条件下所有品牌总销量；占同比 = 本期占有率 − 去年同期占有率。沿用吗？'},
   {q:'第5步 · 比重（sheet4/6/9）：比重 = 本行销量 ÷ 上一级父分类汇总销量。沿用吗？'},
   {q:'第6步 · 品牌范围与排序：保留全部有销量品牌，按本期销量降序；福田等标杆品牌单列对比。沿用吗？'},
-  {q:'第7步 · 输出结构：仍按既定 9 个 sheet 输出（①企业品牌总览 ②分省×品牌 ③分省×福田 ④省→城市→燃料 ⑤大VAN场景 ⑥大VAN米段×功能 ⑦中VAN明盲窗 ⑧风景G系列 ⑨10类专用）。沿用吗？'},
+  {q:'第7步 · 输出结构：仍按既定 13 个 sheet 输出（①企业品牌总览 ②分省×品牌 ③分省×福田 ④省→城市→燃料 ⑤大VAN场景 ⑤.1大VAN产品线 ⑥大VAN米段×功能 ⑦中VAN明盲窗 ⑦.1中VAN新能源产品线 ⑧风景G系列 ⑨10类专用 ⑬福田月度占有率）。沿用吗？'},
 ];
 function guideState(){ const st=state.types[state.activeType]; if(!st.guide) st.guide={step:-1, notes:[]}; return st.guide; }
 
@@ -1485,7 +1797,7 @@ function renderChat(){
   if(!st.chat.length){
     const intro = state.ai.key
       ? `这里是「${curType().name}」的独立交流窗口（AI已接入）。\n直接说你的分析需求，我会像规划 1-4 月报告时那样追问口径，并能直接帮你设置维度/指标、生成图表。`
-      : `这里是「${curType().name}」的独立交流窗口（未接入 API，离线可用）。\n生成 9-sheet 数据分析表【不需要 API】。你可以：\n· 直接选「数据表」点「生成9-sheet报告」立即出表；\n· 或点下方「开始引导问答」，我按当初分析 1-4 月时的流程逐项跟你确认口径，确认完一键出表。`;
+      : `这里是「${curType().name}」的独立交流窗口（未接入 API，离线可用）。\n生成 13-sheet 数据分析表【不需要 API】。你可以：\n· 直接选「数据表」点「生成13-sheet报告」立即出表；\n· 或点下方「开始引导问答」，我按当初分析 1-4 月时的流程逐项跟你确认口径，确认完一键出表。`;
     appendMsg('bot',intro,true);
     if(!state.ai.key) appendGuideStart();
   }
@@ -1518,7 +1830,7 @@ function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&
 function offerGenerate(){
   const log=$('#chatlog'), card=document.createElement('div');
   card.className='msg bot';
-  card.innerHTML=`<div class="who">系统助手</div>口径已逐项确认完毕（与 1-4 月报告一致）。<div class="applycard" onclick="genReport()">▶ 按此口径生成完整 9-sheet 数据分析表</div>`;
+  card.innerHTML=`<div class="who">系统助手</div>口径已逐项确认完毕（与 1-4 月报告一致）。<div class="applycard" onclick="genReport()">▶ 按此口径生成完整 13-sheet 数据分析表</div>`;
   log.appendChild(card); log.scrollTop=log.scrollHeight;
 }
 // 内联 onclick 调用的辅助函数（函数声明已是全局，state 是 let 不可内联访问，故封装）
@@ -1538,7 +1850,7 @@ async function sendChat(){
     else { pushBot('全部 7 项口径已确认完成。'); offerGenerate(); }
     return;
   }
-  if(!state.ai.key){ pushBot('（未接入 AI）已记录。\n提示：出 9-sheet 数据分析表无需 API——直接选「数据表」点「生成9-sheet报告」即可；或点上方「开始引导问答」逐项确认口径。'); return; }
+  if(!state.ai.key){ pushBot('（未接入 AI）已记录。\n提示：出 13-sheet 数据分析表无需 API——直接选「数据表」点「生成13-sheet报告」即可；或点上方「开始引导问答」逐项确认口径。'); return; }
   pushBot('（思考中…）',true);
   try{
     const reply=await callClaude();
@@ -1559,7 +1871,7 @@ function handleAssistantReply(reply){
     if(action.metric){ setSelect('#metricSel',action.metric); }
     const card=document.createElement('div');
     card.className='msg bot';
-    const desc = action.report ? '生成完整 9-sheet 报告' : `生成「${curType().name}」：维度=${action.dimension||$('#dimSel').value}，指标=${action.metric||$('#metricSel').value}`;
+    const desc = action.report ? '生成完整 13-sheet 报告' : `生成「${curType().name}」：维度=${action.dimension||$('#dimSel').value}，指标=${action.metric||$('#metricSel').value}`;
     card.innerHTML=`<div class="who">系统助手</div>按你的要求 → <div class="applycard" onclick="generate()">▶ 点此执行：${escapeHtml(desc)}</div>`;
     $('#chatlog').appendChild(card); $('#chatlog').scrollTop=$('#chatlog').scrollHeight;
     if(action.autorun) generate();
@@ -1574,7 +1886,7 @@ async function callClaude(){
   const sys=`你是资深数据分析师，正帮用户做「VAN类车·西北五省(陕西/内蒙古/甘肃/宁夏/青海)·上险销量」的月度分析。`+
     `当前图表类型：${curType().name}。底表统计期间：${state.base?.period||'未上传'}；可用维度字段：${dims}；指标：销量/同比/占有率。`+
     `分析口径（须遵守）：销量=底表「数量」求和、0值留空；同比=本期÷去年同期-1，去年同期为0且本期有量记「净增长」；占有率=该项÷同列总销量；占同比=本期占有率-去年同期占有率。`+
-    `请像当初规划报告那样：先就不清楚的细节一次追问1-2个最关键问题；待口径清晰后，用简洁中文给结论，并在消息末尾附一段机器指令以驱动界面，格式：\n\`\`\`action\n{"type":"pie|bar|line|table","dimension":"<维度字段名>","metric":"销量|同比|占有率","report":false,"autorun":false}\n\`\`\`\n（"数据表"类型用 {"type":"table","report":true} 表示生成完整9-sheet报告。仅在确实要出图/出表时才附 action，纯追问时不要附。）`;
+    `请像当初规划报告那样：先就不清楚的细节一次追问1-2个最关键问题；待口径清晰后，用简洁中文给结论，并在消息末尾附一段机器指令以驱动界面，格式：\n\`\`\`action\n{"type":"pie|bar|line|table","dimension":"<维度字段名>","metric":"销量|同比|占有率","report":false,"autorun":false}\n\`\`\`\n（"数据表"类型用 {"type":"table","report":true} 表示生成完整13-sheet报告。仅在确实要出图/出表时才附 action，纯追问时不要附。）`;
   const messages=st.chat.filter(m=>m.text&&m.text!=='（思考中…）').map(m=>({role:m.role==='user'?'user':'assistant', content:m.text}));
   const res=await fetch('https://api.anthropic.com/v1/messages',{
     method:'POST',
@@ -1650,12 +1962,12 @@ function generate(){
 let pyodide=null, pyReportCache=null;
 async function ensurePyodide(){
   if(pyodide) return pyodide;
-  setReportStatus('正在加载 Python 运行环境(首次约需 15-30 秒)…',true);
+  setReportStatus('正在加载 Python 运行环境(首次约需 15-30 秒，需联网下载；后续可离线使用)…',true);
   pyodide=await loadPyodide();
   // pandas 走内置编译包；openpyxl 是纯 Python 包，需经 micropip 从 PyPI 安装
   setReportStatus('正在加载 pandas…',true);
   await pyodide.loadPackage(['pandas','micropip']);
-  setReportStatus('正在安装 openpyxl…',true);
+  setReportStatus('正在安装 openpyxl（首次需联网从PyPI下载，后续浏览器会缓存）…',true);
   await pyodide.runPythonAsync(`
 import micropip
 await micropip.install('openpyxl')
@@ -1674,7 +1986,7 @@ async function runReport(){
     if(pyReportCache){ renderReport(pyReportCache); return; }
     await ensurePyodide();
     const hasMK=!!(state.baseMK&&state.baseMK.bytes);
-    setReportStatus(hasMK?'正在按项目模板生成 10-sheet 报告（含微卡 sheet10）…':'正在按项目模板生成 9-sheet 报告…',true);
+    setReportStatus(hasMK?'正在按项目模板生成 14-sheet 报告（含微卡 sheet10）…':'正在按项目模板生成 13-sheet 报告…',true);
     pyodide.FS.writeFile('/work/底表.xlsx', state.base.bytes);
     if(hasMK) pyodide.FS.writeFile('/work/微卡底表.xlsx', state.baseMK.bytes);
     pyodide.runPython('import os; os.chdir("/work")');
@@ -1686,7 +1998,8 @@ async function runReport(){
     pyodide.globals.set('SHEET3_MODE', s3mode);
     pyodide.globals.set('SHEET3_PROV', s3prov||null);
     pyodide.globals.set('HAS_MK', hasMK);   // 有微卡底表才追加 sheet10
-    pyodide.runPython(document.getElementById('py_build').textContent);
+    // 使用 runPythonAsync 避免长时间阻塞UI
+    await pyodide.runPythonAsync(document.getElementById('py_build').textContent);
     const outName=pyodide.globals.get('RESULT_FILE');
     const xlsxBytes=pyodide.FS.readFile('/work/'+outName);
     pyReportCache={name:outName, bytes:new Uint8Array(xlsxBytes)};
@@ -1726,7 +2039,7 @@ function renderReport(rep){
 function exportResult(){
   const r=state._lastResult;
   if(state.activeType==='table'){
-    if(!pyReportCache){ alert('请先生成 9-sheet 报告'); return; }
+    if(!pyReportCache){ alert('请先生成 13-sheet 报告'); return; }
     const blob=new Blob([pyReportCache.bytes],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
     const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=pyReportCache.name; a.click(); URL.revokeObjectURL(a.href);
     return;
