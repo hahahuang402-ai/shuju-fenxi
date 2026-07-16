@@ -551,7 +551,7 @@ def sheet4(ws):
     ws.merge_cells(start_row=r,start_column=1,end_row=r,end_column=3)
     set_widths(ws,9,8.0,ncol,first_cols=3); ws.freeze_panes='D5'
 
-def sheet5(ws):
+async def sheet5(ws):
     off=1
     scenes=[('改装定制',C('J')),('客货两用',C('N')),('商旅客运',C('R')),('专业物流',C('V'))]
     def specfor(denom_rgf):
@@ -602,10 +602,11 @@ def sheet5(ws):
     r=5
     for label,total_label,rgf0 in REGIONS:
         r=block(rgf0,label,total_label,r)
+        await asyncio.sleep(0)
     set_widths(ws,9,8.0,ncol,first_cols=3+off); ws.freeze_panes=_shift('D5',off)
     set_region({}); engine.BASE={}
 
-def sheet5_1(ws):
+async def sheet5_1(ws):
     off=1
     scenes=[('改装定制',C('K')),('客货两用',C('O')),('商旅客运',C('S')),('专业物流',C('W'))]
 
@@ -688,10 +689,11 @@ def sheet5_1(ws):
     r=5
     for label,total_label,rgf0 in REGIONS:
         r=block(rgf0,label,total_label,r)
+        await asyncio.sleep(0)
     set_widths(ws,9,8.0,ncol,first_cols=4+off); ws.freeze_panes=_shift('E5',off)
     set_region({}); engine.BASE={}
 
-def sheet6(ws):
+async def sheet6(ws):
     off=1
 
     # 动态品牌列表：大VAN+燃料筛选下，按本期总销量降序，保留覆盖累计90%所需品牌；福田不在其中则补至末尾
@@ -785,10 +787,11 @@ def sheet6(ws):
     r=5
     for label,total_label,rgf0 in REGIONS:
         r=block(rgf0,label,total_label,r)
+        await asyncio.sleep(0)
     set_widths(ws,9,7.5,ncol,first_cols=2+off); ws.freeze_panes=_shift('C5',off)
     set_region({}); engine.BASE={}
 
-def sheet7(ws):
+async def sheet7(ws):
     off=1
     engine.BASE = ZV
     V6={VOL:'6m³'}; V7={VOL:'7m³'}; V8={VOL:'8m³'}
@@ -842,10 +845,11 @@ def sheet7(ws):
     r=5
     for label,_total,rgf0 in REGIONS:
         r=block(rgf0,label,r)
+        await asyncio.sleep(0)
     set_widths(ws,9,8.0,ncol,first_cols=2+off); ws.freeze_panes=_shift('C5',off)
     set_region({}); engine.BASE={}
 
-def sheet7_1(ws):
+async def sheet7_1(ws):
     off=1
     scope = merged(ZV, NE)
     V6={VOL:'6m³'}; V7={VOL:'7m³'}; V8={VOL:'8m³'}
@@ -938,10 +942,11 @@ def sheet7_1(ws):
     r=5
     for label,total_label,rgf0 in REGIONS:
         r=block(rgf0,label,total_label,r)
+        await asyncio.sleep(0)
     set_widths(ws,9,8.0,ncol,first_cols=4+off); ws.freeze_panes=_shift('E5',off)
     set_region({}); engine.BASE={}
 
-def sheet8(ws):
+async def sheet8(ws):
     off=1
     FUEL='燃料种类'
     VANS={'欧系中VAN':(C('C'),C('D')),'日系大VAN':(C('H'),C('I')),'日系中VAN':(C('M'),C('N'))}
@@ -997,10 +1002,11 @@ def sheet8(ws):
     r=5
     for label,total_label,rgf0 in REGIONS:
         r=block(rgf0,label,total_label,r)
+        await asyncio.sleep(0)
     set_widths(ws,9,8.0,ncol,first_cols=2+off); ws.freeze_panes=_shift('C5',off)
     set_region({}); engine.BASE={}
 
-def sheet9(ws):
+async def sheet9(ws):
     off=1
     K='10类专用'
     cats=['休闲旅居','工程作业','医疗卫生','运钞押运','警用特种','冷链运输','流动服务','民生服务','检测监测','邮政运输']
@@ -1065,6 +1071,7 @@ def sheet9(ws):
     r=4
     for label,total_label,rgf0 in REGIONS:
         r=block(rgf0,label,total_label,r)
+        await asyncio.sleep(0)
     set_widths(ws,10,8.0,ncol,first_cols=1+off); ws.freeze_panes=_shift('B4',off)
     set_region({}); engine.BASE={}
 
@@ -1227,20 +1234,36 @@ def sheet13(ws):
     set_widths(ws, 12, 9.0, LAST_COL, first_cols=1)
     ws.freeze_panes = 'B4'
 
-s1=wb.active; s1.title='sheet1'; sheet1(s1)
-sheet2(wb.create_sheet('sheet2'))
-sheet3(wb.create_sheet('sheet3'))
-sheet4(wb.create_sheet('sheet4'))
-sheet5(wb.create_sheet('sheet5'))
-sheet5_1(wb.create_sheet('sheet5_1'))
-sheet6(wb.create_sheet('sheet6'))
-sheet7(wb.create_sheet('sheet7'))
-sheet7_1(wb.create_sheet('sheet7_1'))
-sheet8(wb.create_sheet('sheet8'))
-sheet9(wb.create_sheet('sheet9'))
-sheet13(wb.create_sheet('sheet13'))
-if globals().get('HAS_MK'):
-    sheet10(wb.create_sheet('sheet10'))
+async def _build_all():
+    s1=wb.active; s1.title='sheet1'; sheet1(s1)
+    await asyncio.sleep(0)
+    sheet2(wb.create_sheet('sheet2'))
+    await asyncio.sleep(0)
+    sheet3(wb.create_sheet('sheet3'))
+    await asyncio.sleep(0)
+    sheet4(wb.create_sheet('sheet4'))
+    await asyncio.sleep(0)
+    await sheet5(wb.create_sheet('sheet5'))
+    await asyncio.sleep(0)
+    await sheet5_1(wb.create_sheet('sheet5_1'))
+    await asyncio.sleep(0)
+    await sheet6(wb.create_sheet('sheet6'))
+    await asyncio.sleep(0)
+    await sheet7(wb.create_sheet('sheet7'))
+    await asyncio.sleep(0)
+    await sheet7_1(wb.create_sheet('sheet7_1'))
+    await asyncio.sleep(0)
+    await sheet8(wb.create_sheet('sheet8'))
+    await asyncio.sleep(0)
+    await sheet9(wb.create_sheet('sheet9'))
+    await asyncio.sleep(0)
+    sheet13(wb.create_sheet('sheet13'))
+    await asyncio.sleep(0)
+    if globals().get('HAS_MK'):
+        sheet10(wb.create_sheet('sheet10'))
+        await asyncio.sleep(0)
+
+await _build_all()
 OUTNAME=f'{MAXY}年1-{MAXM}月分析结果.xlsx'
 wb.save(OUTNAME)
 RESULT_FILE=OUTNAME
